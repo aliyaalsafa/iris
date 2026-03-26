@@ -28,10 +28,10 @@ pub(crate) const SYMMETRIC_RSS_KEY: [u8; 52] = [
 const RSS_RETA_SIZE: usize = 512;
 
 #[derive(Debug, Copy, Clone, Hash, Ord, Eq, PartialEq, PartialOrd)]
-pub(crate) struct PortId(pub(crate) u16);
+pub struct PortId(pub u16);
 
 impl PortId {
-    pub(crate) fn new_from_device(device: String) -> PortId {
+    pub fn new_from_device(device: String) -> PortId {
         let mut port_id: u16 = 0;
         let _device = device.clone();
         let ret = unsafe {
@@ -57,7 +57,7 @@ impl PortId {
     }
 
     /// For DPDK functions
-    pub(crate) fn raw(&self) -> u16 {
+    pub fn raw(&self) -> u16 {
         self.0
     }
 

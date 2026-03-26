@@ -59,12 +59,12 @@ pub mod config;
 pub mod conntrack;
 #[doc(hidden)]
 #[allow(clippy::all)]
-mod dpdk;
+pub mod dpdk;
 pub mod filter;
 pub mod lcore;
 pub mod memory;
 pub mod multicore;
-mod port;
+pub mod port;
 pub mod protocols;
 mod runtime;
 pub mod stats;
@@ -81,6 +81,7 @@ pub use self::runtime::Runtime;
 
 pub use dpdk::rte_lcore_id;
 pub use dpdk::rte_rdtsc;
+pub use dpdk::rte_flow;
 
 #[macro_use]
 extern crate pest_derive;

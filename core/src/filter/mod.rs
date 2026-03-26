@@ -17,8 +17,11 @@ pub mod ptree;
 #[doc(hidden)]
 pub mod subscription;
 
+pub mod flow_drop;
+
 use crate::conntrack::{ConnInfo, StateTransition};
 use crate::filter::ast::Predicate;
+use crate::filter::hardware::install_dyn_hardware_rules;
 use crate::filter::hardware::{flush_rules, HardwareFilter};
 use crate::filter::parser::FilterParser;
 use crate::filter::pattern::{FlatPattern, LayeredPattern};
@@ -154,6 +157,12 @@ impl Filter {
                 bail!(error);
             }
         }
+    }
+
+    pub(crate) fn set_dynamic_hardware_filters(&self, port: &Port) -> Result<()> {
+        // Add default rule that forward everything from port 0 to port 1
+        // Add RSS rule on table 1
+        install_dyn_hardware_rules(port)
     }
 }
 

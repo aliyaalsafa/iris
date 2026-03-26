@@ -328,6 +328,10 @@ pub struct OnlineConfig {
     #[serde(default = "default_hardware_assist")]
     pub hardware_assist: bool,
 
+    /// If set will push necessary rules for the dynamic NIC filtering
+    #[serde(default = "default_dyn_hardware_assist")]
+    pub dyn_hardware_assist: bool,
+
     /// If set, will pass supplementary arguments to DPDK EAL (see DPDK
     /// configuration). For instance `--no-huge`.
     /// Defaults to empty string.
@@ -353,6 +357,10 @@ fn default_duration() -> Option<u64> {
 
 fn default_hardware_assist() -> bool {
     true
+}
+
+fn default_dyn_hardware_assist() -> bool {
+    false
 }
 
 fn default_dpdk_supl_args() -> Vec<String> {
