@@ -173,12 +173,16 @@ pub use rte_eth_fc_mode_RTE_ETH_FC_NONE as rte_eth_fc_mode_RTE_FC_NONE;
 pub use rte_eth_rx_mq_mode_RTE_ETH_MQ_RX_RSS as rte_eth_rx_mq_mode_ETH_MQ_RX_RSS;
 #[cfg(dpdk_ge_2311)]
 pub use RTE_ETH_RETA_GROUP_SIZE as RTE_RETA_GROUP_SIZE;
+
+// Changed dpdk v23.11 to use 64-bit values for RSS hash types, 
+// so we need to redefine these constants here.
 #[cfg(dpdk_ge_2311)]
-pub use RTE_ETH_RSS_IP as ETH_RSS_IP;
+pub const ETH_RSS_IP: u64 = 1 << 2;
 #[cfg(dpdk_ge_2311)]
-pub use RTE_ETH_RSS_TCP as ETH_RSS_TCP;
+pub const ETH_RSS_TCP: u64 = (1 << 4) | (1 << 10) | (1 << 16);
 #[cfg(dpdk_ge_2311)]
-pub use RTE_ETH_RSS_UDP as ETH_RSS_UDP;
+pub const ETH_RSS_UDP: u64 = (1 << 5) | (1 << 11) | (1 << 17);
+
 #[cfg(dpdk_ge_2311)]
 pub use RTE_ETH_VLAN_STRIP_OFFLOAD as DEV_RX_OFFLOAD_VLAN_STRIP;
 
