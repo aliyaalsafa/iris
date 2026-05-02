@@ -19,9 +19,10 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(dpdk_ge_2111)");
     println!("cargo:rustc-check-cfg=cfg(dpdk_ge_2311)");
     println!("cargo:rustc-check-cfg=cfg(dpdk_ge_2411)");
+    println!("cargo:rustc-check-cfg=cfg(dpdk_ge_2511)");
     let dpdk_version = env::var("DPDK_VERSION").expect("Set DPDK_VERSION env variable");
 
-    if !["20.11", "21.08", "23.11", "24.11"].contains(&dpdk_version.as_str()) {
+    if !["20.11", "21.08", "23.11", "24.11", "25.11"].contains(&dpdk_version.as_str()) {
         println!("Unsupported dpdk version");
         exit(1);
     }
@@ -35,6 +36,9 @@ fn main() {
                 println!("cargo:rustc-cfg=dpdk_ge_2311");
                 if dpdk_version != "23.11" {
                     println!("cargo:rustc-cfg=dpdk_ge_2411");
+                    if dpdk_version != "24.11" {
+                        println!("cargo:rustc-cfg=dpdk_ge_2511");
+                    }
                 }
             }
         }
