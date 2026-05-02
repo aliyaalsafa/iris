@@ -332,6 +332,16 @@ pub struct OnlineConfig {
     #[serde(default = "default_dyn_hardware_assist")]
     pub dyn_hardware_assist: bool,
 
+    /// If set, install an Intel-ICE raw-pattern rule that drops TLS
+    /// Application-Data records (type=0x17) over TCP at port startup.
+    #[serde(default = "default_drop_tls_raw")]
+    pub drop_tls_raw: bool,
+
+    /// If set, install an Intel-ICE raw-pattern rule that drops QUIC
+    /// short-header packets (form=0, fixed=1) over UDP at port startup.
+    #[serde(default = "default_drop_quic_raw")]
+    pub drop_quic_raw: bool,
+
     /// If set, will pass supplementary arguments to DPDK EAL (see DPDK
     /// configuration). For instance `--no-huge`.
     /// Defaults to empty string.
@@ -360,6 +370,14 @@ fn default_hardware_assist() -> bool {
 }
 
 fn default_dyn_hardware_assist() -> bool {
+    false
+}
+
+fn default_drop_tls_raw() -> bool {
+    false
+}
+
+fn default_drop_quic_raw() -> bool {
     false
 }
 

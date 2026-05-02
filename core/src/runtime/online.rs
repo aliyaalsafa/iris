@@ -198,6 +198,33 @@ where
             } else {
                 log::info!("No hardware assist configured for port {}, passing all traffic through device.", port.id);
             }
+
+            if self.options.online.drop_tls_raw {
+                log::info!(
+                    "Installing TLS Application-Data raw drop on port {}",
+                    port.id
+                );
+                if let Err(e) = crate::filter::flow_drop::install_tls_appdata_drop(port.id) {
+                    log::warn!(
+                        "TLS Application-Data raw drop install failed on port {}: {:?}",
+                        port.id,
+                        e
+                    );
+                }
+            }
+            if self.options.online.drop_quic_raw {
+                log::info!(
+                    "Installing QUIC short-header raw drop on port {}",
+                    port.id
+                );
+                if let Err(e) = crate::filter::flow_drop::install_quic_short_drop(port.id) {
+                    log::warn!(
+                        "QUIC short-header raw drop install failed on port {}: {:?}",
+                        port.id,
+                        e
+                    );
+                }
+            }
         }
     }
 
