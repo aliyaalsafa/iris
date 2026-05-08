@@ -4,7 +4,7 @@ use lazy_static::lazy_static;
 
 use iris_core::{
     config::{default_config, load_config},
-    filter::flow_drop::{install_drop_flow, uninstall_drop_flow},
+    filter::flow_drop::{install_drop_flow, uninstall_flow},
     port::PortId,
     rte_flow,
 //    CoreId,
@@ -198,7 +198,7 @@ fn main() {
         for entry in inst.drain(..) {
             let raw_ptrs: Vec<*mut rte_flow> =
                 entry.flow_ptrs.iter().map(|fp| fp.0).collect();
-            if let Err(e) = uninstall_drop_flow(entry.ports.clone(), raw_ptrs) {
+            if let Err(e) = uninstall_flow(entry.ports.clone(), raw_ptrs) {
                 eprintln!("[loss_test] uninstall error: {:?}", e);
             }
         }
