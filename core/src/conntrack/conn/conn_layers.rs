@@ -272,13 +272,15 @@ impl TrackableLayer for L7Session {
         if matches!(self.linfo.state, LayerState::None) {
             return None;
         }
-        // Discovery failed
+        // Discovery failed — no data to probe, stop
         if matches!(self.linfo.state, LayerState::Discovery) {
+            self.linfo.actions.clear(&Actions::Parse);
             return Some(StateTransition::L7OnDisc);
         }
         self.pending_sessions.extend(self.parser.drain_sessions());
-        // Parsing failed
+        // Parsing failed — nothing left to drain, stop
         if self.pending_sessions.is_empty() {
+            self.linfo.actions.clear(&Actions::Parse);
             return Some(StateTransition::L7EndHdrs);
         }
         // New session ready
