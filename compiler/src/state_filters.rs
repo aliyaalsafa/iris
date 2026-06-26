@@ -238,8 +238,8 @@ fn add_unary_pred(
     };
 
     let mut body: Vec<proc_macro2::TokenStream> = vec![];
-    gen_state_filter_util(&mut body, node, tree, statics, sub, extract_sessions);
     update_body(&mut body, node, sub);
+    gen_state_filter_util(&mut body, node, tree, statics, sub, extract_sessions);
 
     if first_unary {
         code.push(quote! {
@@ -298,8 +298,8 @@ fn add_pred(
     extract_sessions: bool,
 ) {
     let mut body: Vec<proc_macro2::TokenStream> = vec![];
-    gen_state_filter_util(&mut body, node, tree, statics, sub, extract_sessions);
     update_body(&mut body, node, sub);
+    gen_state_filter_util(&mut body, node, tree, statics, sub, extract_sessions);
     if node.if_else {
         code.push(quote! {
             else if #pred_tokenstream {
