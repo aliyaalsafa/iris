@@ -50,4 +50,14 @@ pcie = true
 # Compare against the PCIe figures above: inbound DMA versus what reached memory.
 # Needs `pcm-memory` installed and root.
 dram = true
-port_stats = [ "rx_good_packets", "rx_good_bytes", "rx_phy_packets", "rx_phy_bytes", "rx_mbuf_allocation_errors", "rx_phy_discard_packets", "rx_missed_errors", "drop_rule",]
+port_stats = [
+    "rx_good_packets",
+    "rx_good_bytes",
+    "rx_phy_packets",
+    "rx_phy_bytes",
+    "rx_mbuf_allocation_errors",
+    "rx_phy_discard_packets",
+    "rx_missed_errors",
+    # Disabled: sampling every drop rule's counter each tick can't keep up with line rate.
+    # "drop_rule",
+]
