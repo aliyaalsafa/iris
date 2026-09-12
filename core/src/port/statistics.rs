@@ -17,8 +17,9 @@ pub(crate) struct PortStats {
 }
 
 impl PortStats {
-    /// Retrieve port statistics at current time
-    pub(crate) fn collect(port_id: PortId) -> Result<Self> {
+    /// Retrieve port statistics at current time. The drop rule statistics are
+    /// only sampled, and only present, when `keywords` selects one of them.
+    pub(crate) fn collect(port_id: PortId, keywords: &[String]) -> Result<Self> {
         // temporary table used to get number of available statistics
         let mut table: Vec<dpdk::rte_eth_xstat> = vec![];
         let len = unsafe { dpdk::rte_eth_xstats_get(port_id.raw(), table.as_mut_ptr(), 0) };
@@ -71,10 +72,20 @@ impl PortStats {
         // Carried in this map so a `port_stats` keyword selects them exactly as
         // it selects rx_split, in both the live display and the CSV, instead of
         // each of those having to know about them separately.
-        crate::filter::flow_drop::sample_drop_counters(Some(port_id.raw()));
-        let (drop_pkts, drop_bytes) = crate::filter::flow_drop::drop_stats(port_id.raw());
-        stats.insert("drop_rule_packets".to_owned(), drop_pkts);
-        stats.insert("drop_rule_bytes".to_owned(), drop_bytes);
+        //
+        // Sampling queries every resident rule's counter, so it is skipped
+        // unless a keyword would select one of these labels. Matching is the
+        // same substring test `display` and the CSV logger apply.
+        const DROP_LABELS: [&str; 2] = ["drop_rule_packets", "drop_rule_bytes"];
+        if DROP_LABELS
+            .iter()
+            .any(|label| keywords.iter().any(|k| label.contains(k.as_str())))
+        {
+            crate::filter::flow_drop::sample_drop_counters(Some(port_id.raw()));
+            let (drop_pkts, drop_bytes) = crate::filter::flow_drop::drop_stats(port_id.raw());
+            stats.insert(DROP_LABELS[0].to_owned(), drop_pkts);
+            stats.insert(DROP_LABELS[1].to_owned(), drop_bytes);
+        }
 
         Ok(PortStats { stats, port_id })
     }

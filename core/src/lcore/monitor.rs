@@ -470,7 +470,7 @@ impl Logger {
     /// Initialize port statistic CSV writers. Must occur after ports have been started.
     fn init_port_wtrs(&mut self) -> Result<()> {
         for (port_id, wtr) in self.port_wtrs.iter_mut() {
-            let port_stats = PortStats::collect(*port_id)?;
+            let port_stats = PortStats::collect(*port_id, &self.keywords)?;
             wtr.write_field("ts")?;
             for label in port_stats.stats.keys() {
                 if self.keywords.iter().any(|k| label.contains(k)) {
@@ -494,7 +494,7 @@ impl Logger {
         let mut missing_phy = false;
 
         for (port_id, wtr) in self.port_wtrs.iter_mut() {
-            let port_stats = PortStats::collect(*port_id);
+            let port_stats = PortStats::collect(*port_id, &self.keywords);
             match port_stats {
                 Ok(port_stats) => {
                     // Read outside the keyword filter: these are the budget's denominator, and a
@@ -708,7 +708,7 @@ impl AggRxStats {
                 .map(|queue| queue.qid.raw())
                 .collect();
 
-            match PortStats::collect(*port_id) {
+            match PortStats::collect(*port_id, keywords) {
                 Ok(port_stats) => {
                     // Ingress (reached NIC)
                     ingress_bytes += match port_stats.stats.get("rx_phy_bytes") {
