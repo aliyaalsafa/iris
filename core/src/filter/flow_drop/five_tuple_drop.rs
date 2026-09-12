@@ -55,28 +55,28 @@ static DROP_COUNTERS: Mutex<BTreeMap<(u16, usize), (u64, u64)>> = Mutex::new(BTr
 static DROP_BY_PORT: Mutex<BTreeMap<u16, (u64, u64)>> = Mutex::new(BTreeMap::new());
 
 /// Fold one counter reading into the totals, as a delta against the previous
-/// reading of the same handle.
+/// reading of the same handle. Called with `DROP_COUNTERS` held.
 ///
-/// `None` for `raw` retires the handle: its last delta is taken and the entry
-/// removed, for use when the rule is about to be destroyed.
-fn fold_reading(port: u16, handle: usize, raw: Option<(u64, u64)>) {
-    let mut seen = DROP_COUNTERS.lock().unwrap();
-    let key = (port, handle);
-    let (hits, bytes) = match raw {
-        Some(v) => v,
-        None => {
-            seen.remove(&key);
-            return;
-        }
+/// A reading for a handle that is not tracked is discarded. Either it is not a
+/// drop rule's counter (split rules count steered packets, not discards), or
+/// the rule was already retired and its handle may be destroyed, in which case
+/// the PMD can answer from a freed or reissued counter slot. Folding such a
+/// reading from a zero baseline once added values near 2^64 to the totals.
+fn fold_reading(
+    seen: &mut BTreeMap<(u16, usize), (u64, u64)>,
+    port: u16,
+    handle: usize,
+    (hits, bytes): (u64, u64),
+) {
+    let Some(last) = seen.get_mut(&(port, handle)) else {
+        return;
     };
-    let (last_hits, last_bytes) = seen.get(&key).copied().unwrap_or((0, 0));
-    // A counter that went backwards means the handle was reused under us, or
-    // the PMD reset it; treat the new reading as the whole delta rather than
-    // underflowing.
+    let (last_hits, last_bytes) = *last;
+    // A counter that went backwards (the PMD reset it) contributes nothing
+    // rather than underflowing.
     let d_hits = hits.saturating_sub(last_hits);
     let d_bytes = bytes.saturating_sub(last_bytes);
-    seen.insert(key, (hits, bytes));
-    drop(seen);
+    *last = (hits, bytes);
 
     if d_hits == 0 && d_bytes == 0 {
         return;
@@ -127,14 +127,31 @@ pub fn sample_drop_counters(port: Option<u16>) {
             .collect()
     };
     for (port, handle) in tracked {
-        match query_flow_stats(port, handle as *mut rte_flow_action_handle) {
-            Ok(raw) => fold_reading(port, handle, Some(raw)),
-            // A handle destroyed between listing and querying is normal, and
-            // so is a PMD that cannot answer right now; the next tick retries
-            // and the differencing means nothing is lost meanwhile.
-            Err(_) => continue,
-        }
+        // A handle retired between listing and querying is skipped inside
+        // sample_handle. A PMD that cannot answer right now is normal too; the
+        // next tick retries and the differencing means nothing is lost.
+        let _ = sample_handle(port, handle as *mut rte_flow_action_handle, false);
     }
+}
+
+/// Query one tracked handle's counter and fold the reading, holding
+/// `DROP_COUNTERS` throughout so the query cannot interleave with another
+/// thread retiring and destroying the handle. `retire` stops tracking the
+/// handle afterwards, for the final reading before the rule is destroyed.
+///
+/// Untracked handles are not queried at all.
+fn sample_handle(port: u16, handle: *mut rte_flow_action_handle, retire: bool) -> Result<()> {
+    let mut seen = DROP_COUNTERS.lock().unwrap();
+    let key = (port, handle as usize);
+    if !seen.contains_key(&key) {
+        return Ok(());
+    }
+    let result = query_flow_stats(port, handle)
+        .map(|raw| fold_reading(&mut seen, port, handle as usize, raw));
+    if retire {
+        seen.remove(&key);
+    }
+    result
 }
 
 /// Packets and bytes dropped by this port's five-tuple rules since startup.
@@ -599,14 +616,13 @@ pub fn uninstall_flow(
         }
 
         if !handle.is_null() {
-            // Final reading, folded as a delta like any other: the rule may
-            // already have been sampled many times while it was resident.
-            match query_flow_stats(port_id.raw(), handle) {
-                Ok(raw) => fold_reading(port_id.raw(), handle as usize, Some(raw)),
-                Err(e) => eprintln!("Port {} flow stats unavailable: {}", port_id.raw(), e),
+            // Final reading, folded as a delta like any other since the rule
+            // may already have been sampled while resident, and the handle
+            // retired under the same lock, before it is destroyed below and
+            // its address can be reissued.
+            if let Err(e) = sample_handle(port_id.raw(), handle, true) {
+                eprintln!("Port {} flow stats unavailable: {}", port_id.raw(), e);
             }
-            // Stop tracking it before the handle address can be reissued.
-            fold_reading(port_id.raw(), handle as usize, None);
         }
 
         let mut error: rte_flow_error = unsafe { mem::zeroed() };
@@ -683,13 +699,12 @@ pub fn query_resident_flow(
             continue;
         }
 
-        match query_flow_stats(port_id.raw(), handle) {
-            Ok(raw) => fold_reading(port_id.raw(), handle as usize, Some(raw)),
-            Err(e) => eprintln!(
+        if let Err(e) = sample_handle(port_id.raw(), handle, false) {
+            eprintln!(
                 "Port {} resident flow stats unavailable: {}",
                 port_id.raw(),
                 e
-            ),
+            );
         }
     }
 
