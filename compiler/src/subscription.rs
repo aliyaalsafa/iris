@@ -167,6 +167,20 @@ pub(crate) struct SubscriptionDecoder {
 
 impl SubscriptionDecoder {
     pub(crate) fn new(inputs: &Vec<ParsedInput>) -> Self {
+        Self::decode(inputs, false)
+    }
+
+    /// As [`SubscriptionDecoder::new`], but tolerating a program that declares no
+    /// subscriptions at all.
+    ///
+    /// Only `#[iris_end_macros(no_subscriptions)]` asks for this. An application driven
+    /// entirely by an `iris_core` packet tap has no callbacks by design; for everybody
+    /// else an empty set means a `#[callback]` was forgotten, which is worth catching.
+    pub(crate) fn new_without_subscriptions(inputs: &Vec<ParsedInput>) -> Self {
+        Self::decode(inputs, true)
+    }
+
+    fn decode(inputs: &Vec<ParsedInput>, allow_empty: bool) -> Self {
         let mut ret = Self {
             filters_raw: BTreeMap::new(),
             datatypes_raw: BTreeMap::new(),
@@ -191,7 +205,11 @@ impl SubscriptionDecoder {
             spec.add_invoke_once();
         }
         ret.decode_updates();
-        assert!(!ret.cbs_raw.is_empty(), "No callbacks defined");
+        assert!(
+            allow_empty || !ret.cbs_raw.is_empty(),
+            "No callbacks defined. If that is deliberate -- an application driven only \
+             by an iris_core packet tap -- say #[iris_end_macros(no_subscriptions)]."
+        );
         ret
     }
 

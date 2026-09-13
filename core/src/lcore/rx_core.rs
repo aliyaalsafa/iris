@@ -125,6 +125,12 @@ where
 
         let mut now = Instant::now();
 
+        // Read once, here, rather than per packet: with no tap installed the datapath
+        // then pays a predictable branch on a register-resident `Option<fn>` instead of
+        // an atomic load per mbuf. An install after this point is not picked up, which
+        // is why `packet_tap::install` documents "before `Runtime::run`".
+        let packet_tap = crate::lcore::packet_tap::installed();
+
         // Cycle budget for this lcore. See `DatapathBudget`.
         // Timestamps within a sampled iteration are chained.
         // Each span has one read's cost subtracted to avoid skewing short spans.
@@ -218,6 +224,13 @@ where
                 }
 
                 for mbuf in mbufs.into_iter() {
+                    // Ahead of everything else, including the flow table: a packet a
+                    // drop rule sheds still arrived, and an observer measuring what is
+                    // on the wire wants to see it.
+                    if let Some(tap) = packet_tap {
+                        tap(&mbuf, &self.id, now);
+                    }
+
                     // Consult the flow table first, just as the NIC would apply
                     // rte_flow rules before the packet reaches the pipeline.
                     if let Some(ft) = flow_table.as_mut() {

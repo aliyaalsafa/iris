@@ -16,6 +16,7 @@ members = [
     "examples/flow_collect", "examples/flow_features", "examples/flow_test", "examples/flow_labels",
     "examples/trim_check",
     "examples/flow_arrivals",
+    "examples/flow_cardinality",
     # "examples/loss_test", "examples/timeout_test", "examples/tls_quic",
     # "examples/tls_quic_drop",
     # "examples/tls_quic_measure",

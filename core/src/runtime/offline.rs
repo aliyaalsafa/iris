@@ -10,6 +10,7 @@ use crate::subscription::*;
 use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::sync::Arc;
+use std::time::Instant;
 
 use cpu_time::ProcessTime;
 use pcap::Capture;
@@ -95,6 +96,13 @@ where
         let mut t_cursor = loop_start;
         let mut rdtsc_reads: u64 = 1;
 
+        // See the note in `RxCore::rx_process`: read once, not per frame.
+        let packet_tap = crate::lcore::packet_tap::installed();
+        // The online loop refreshes its clock every ~1024 iterations off `TOTAL_CYCLES`;
+        // there is no such counter here, so keep the stride locally. Sub-millisecond
+        // staleness is well inside what the tap's coarse clock promises.
+        let mut now = Instant::now();
+
         let start = ProcessTime::try_now().expect("Getting process time failed");
         while let Ok(frame) = cap.next() {
             if frame.header.len as usize > self.options.offline.mtu {
@@ -103,6 +111,13 @@ where
             let mbuf = Mbuf::from_bytes(frame.data, mempool_raw)
                 .expect("Unable to allocate mbuf. Try increasing mempool size.");
             nb_frames += 1;
+
+            if let Some(tap) = packet_tap {
+                if nb_frames & 1023 == 0 {
+                    now = Instant::now();
+                }
+                tap(&mbuf, &self.id, now);
+            }
 
             if let Some(ft) = flow_table.as_mut() {
                 // Apply any pending flow rules pushed by the control plane.

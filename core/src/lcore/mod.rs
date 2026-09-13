@@ -3,6 +3,7 @@
 pub mod datapath_budget;
 pub mod dram_meter;
 pub(crate) mod monitor;
+pub mod packet_tap;
 pub mod pcie_meter;
 // pub(crate) mod ring;
 pub(crate) mod rx_core;
