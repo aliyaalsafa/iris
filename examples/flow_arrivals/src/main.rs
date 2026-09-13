@@ -14,6 +14,12 @@
 //! A live line goes to stdout every `--print-interval` seconds; the full per-second
 //! series — a column per category plus `all` — is written to `--csv` at shutdown.
 //!
+//! `--warmup-secs N` throws away every flow arriving in the first N seconds so the
+//! startup transient stays out of the measurement. It filters on *arrival* time, so a
+//! flow that arrived during warmup is discarded even when its classification only
+//! resolves later. Second 0 of the series, and the denominator of both averages, are
+//! then the end of warmup rather than the start of the process.
+//!
 //! ## What the numbers do and don't include
 //!
 //! - Iris builds a TCP connection only from a pure SYN (`Conn::new_tcp`), so SYN scans
@@ -118,12 +124,22 @@ impl CoreBuckets {
 static BUCKETS: OnceLock<Vec<CoreBuckets>> = OnceLock::new();
 /// Baseline for the second index. Set just before the runtime starts.
 static START: OnceLock<Instant> = OnceLock::new();
+/// Seconds of arrivals to throw away at the start of the run (`--warmup-secs`).
+static WARMUP_SECS: OnceLock<u64> = OnceLock::new();
+/// Flows deliberately thrown away because they arrived during warmup. Distinct from
+/// [`UNFILED`]: this is the feature working, not a shortfall.
+static WARMUP_DISCARDED: AtomicU64 = AtomicU64::new(0);
 /// Flows that arrived but could not be filed: their arrival second (or core id) was
 /// outside the allocated bucket array, so there was nowhere to count them. A
 /// bookkeeping shortfall in this app — not packet loss, which the online monitor
 /// reports separately as `HW/SW Dropped`.
 static UNFILED: AtomicU64 = AtomicU64::new(0);
 static RUNNING: AtomicBool = AtomicBool::new(true);
+
+#[inline]
+fn warmup_secs() -> u64 {
+    *WARMUP_SECS.get().unwrap_or(&0)
+}
 
 fn buckets() -> &'static Vec<CoreBuckets> {
     BUCKETS.get().expect("buckets() before init_buckets()")
@@ -133,11 +149,34 @@ fn init_buckets(ncores: usize, nsecs: usize) {
     let _ = BUCKETS.set((0..ncores).map(|_| CoreBuckets::new(nsecs)).collect());
 }
 
-/// Seconds between the run's start and this flow's first packet.
+/// This flow's position in the measured series: seconds since the end of warmup, or
+/// `None` if it arrived during warmup and is being discarded.
+///
+/// `checked_sub` gives both behaviours at once -- `None` inside the warmup window, and
+/// `0` for a flow arriving exactly at the boundary, which counts because N seconds
+/// *have* passed by then.
 #[inline]
-fn arrival_sec(start: &StartTime) -> usize {
+fn arrival_sec(start: &StartTime) -> Option<usize> {
     let base = START.get().expect("START unset");
-    start.saturating_duration_since(*base).as_secs() as usize
+    let secs = start.saturating_duration_since(*base).as_secs();
+    secs.checked_sub(warmup_secs()).map(|s| s as usize)
+}
+
+/// Credit one flow of `cat` to the second it arrived in.  Returns false if it arrived
+/// during warmup and was discarded.
+///
+/// Warmup filters on *arrival* time, not on when this fires: the scan and maybe_quic
+/// callbacks run seconds after the flow arrived, and crediting them by callback time
+/// would drop rows into the warmup window the rest of the app has already excluded.
+#[inline]
+fn record(core_id: &CoreId, start: &StartTime, cat: usize) -> bool {
+    match arrival_sec(start) {
+        Some(sec) => {
+            bump(core_id, sec, cat);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Credit one flow of `cat`, arriving in second `sec`, to `core_id`'s series.
@@ -300,7 +339,13 @@ fn on_arrival(five_tuple: &FiveTuple, start: &StartTime, core_id: &CoreId) {
         UDP_PROTOCOL => CAT_UDP,
         _ => return,
     };
-    bump(core_id, arrival_sec(start), cat);
+    // Counting warmup discards here rather than inside `record` keeps the tally a flow
+    // count: every flow reaches this callback exactly once, and through exactly one of
+    // tcp/udp, whereas the later callbacks would each add another discard for the same
+    // flow.
+    if !record(core_id, start, cat) {
+        WARMUP_DISCARDED.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Whatever the L7 parsers claim, credited back to the flow's arrival second.
@@ -321,21 +366,21 @@ fn on_l7_discovery(session_proto: &SessionProto, start: &StartTime, core_id: &Co
         SessionProto::Ssh => CAT_SSH,
         _ => return,
     };
-    bump(core_id, arrival_sec(start), cat);
+    record(core_id, start, cat);
 }
 
 /// TCP flows whose SYN went unanswered, as decided by [`UnansweredSyn`] at
 /// termination and credited back to the second the SYN arrived.
 #[callback("tcp and UnansweredSyn,level=L4Terminated")]
 fn on_unanswered_syn(start: &StartTime, core_id: &CoreId) {
-    bump(core_id, arrival_sec(start), CAT_UNANSWERED_SYN);
+    record(core_id, start, CAT_UNANSWERED_SYN);
 }
 
 /// TCP flows whose SYN drew only a RST, as decided by [`RefusedSyn`] at termination
 /// and credited back to the second the SYN arrived.
 #[callback("tcp and RefusedSyn,level=L4Terminated")]
 fn on_refused_syn(start: &StartTime, core_id: &CoreId) {
-    bump(core_id, arrival_sec(start), CAT_REFUSED_SYN);
+    record(core_id, start, CAT_REFUSED_SYN);
 }
 
 /// Mid-stream QUIC the parsers miss, credited back to the flow's arrival second.
@@ -351,7 +396,7 @@ fn on_refused_syn(start: &StartTime, core_id: &CoreId) {
 /// teardown.
 #[callback("MaybeQuic,level=InL4Conn")]
 fn on_maybe_quic(start: &StartTime, core_id: &CoreId) -> bool {
-    bump(core_id, arrival_sec(start), CAT_MAYBE_QUIC);
+    record(core_id, start, CAT_MAYBE_QUIC);
     false
 }
 
@@ -376,8 +421,15 @@ struct Args {
     #[clap(long, default_value = "30")]
     print_interval: u64,
 
-    /// Seconds of bucket space to allocate. Defaults to `[online] duration` plus a
-    /// minute of slack for the late-resolving series, or one hour if unset.
+    /// Discard every flow arriving in the first N seconds, so the startup transient
+    /// stays out of the measurement.  Filtered on arrival time, so a flow that arrives
+    /// during warmup is discarded even when its classification resolves later.
+    #[clap(long, default_value = "0")]
+    warmup_secs: u64,
+
+    /// Seconds of bucket space to allocate for the measured window (i.e. excluding
+    /// warmup). Defaults to `[online] duration` plus a minute of slack for the
+    /// late-resolving series, or one hour if unset.
     #[clap(long)]
     max_seconds: Option<usize>,
 }
@@ -417,6 +469,8 @@ fn totals(series: &[[u64; NCAT]]) -> [u64; NCAT] {
 /// One row per second, up to the last second with any activity: a column per category,
 /// plus the two derived totals from the summary — `all` and `encrypted`. A running
 /// cumulative is a prefix sum away, so it is left to whatever reads this.
+///
+/// `second` counts from the end of warmup, so row 0 is the first measured second.
 fn write_csv(path: &PathBuf, series: &[[u64; NCAT]]) -> std::io::Result<usize> {
     let last = series
         .iter()
@@ -463,19 +517,25 @@ fn main() {
             .map_or(3600, |d| d as usize + 60)
     });
     init_buckets(ncores, nsecs);
-    println!("flow_arrivals: {ncores} core slots x {nsecs} seconds");
+    let warmup = args.warmup_secs;
+    println!("flow_arrivals: {ncores} core slots x {nsecs} seconds, {warmup}s warmup");
 
     let interval = Duration::from_secs(args.print_interval.max(1));
+    let warmup_dur = Duration::from_secs(warmup);
     let start = Instant::now();
     START.set(start).expect("START already set");
+    WARMUP_SECS.set(warmup).expect("WARMUP_SECS already set");
 
     // No app-level periodic hook exists (the 1Hz Monitor is core-internal and online
     // only), so live reporting is our own thread. The buckets are already indexed by
     // arrival second, so it only reads and prints.
     let reporter = std::thread::spawn(move || {
         let mut prev = [0u64; NCAT];
-        let mut prev_elapsed = Duration::ZERO;
-        let mut next_print = interval;
+        // Both clocks start at the end of warmup: nothing is counted before then, so
+        // printing earlier emits all-zero lines and the first real interval would be
+        // diluted by the warmup seconds it straddled.
+        let mut prev_elapsed = warmup_dur;
+        let mut next_print = warmup_dur + interval;
         while RUNNING.load(Ordering::Relaxed) {
             // Short naps so shutdown is prompt rather than up to `interval` late.
             std::thread::sleep(Duration::from_millis(250));
@@ -487,7 +547,7 @@ fn main() {
             // The actual gap, not the nominal interval: waking on a 250ms granularity
             // overshoots a little every time, and that drift would skew the rate.
             print_live(
-                elapsed,
+                elapsed - warmup_dur,
                 &prev,
                 &curr,
                 (elapsed - prev_elapsed).as_secs_f64(),
@@ -506,8 +566,14 @@ fn main() {
 
     let series = collect();
     let totals = totals(&series);
-    let elapsed = start.elapsed().as_secs_f64();
-    println!("\n=== flow arrivals over {elapsed:.1}s ===");
+    // The measured window, not the whole run: dividing the averages by wall clock would
+    // dilute them with the warmup seconds whose flows were thrown away.
+    let measured = (start.elapsed().as_secs_f64() - warmup as f64).max(0.0);
+    if warmup == 0 {
+        println!("\n=== flow arrivals over {measured:.1}s ===");
+    } else {
+        println!("\n=== flow arrivals over {measured:.1}s (after {warmup}s warmup) ===");
+    }
     for cat in 0..NCAT {
         println!("{:>20}  {}", CAT_NAMES[cat], totals[cat]);
     }
@@ -516,15 +582,25 @@ fn main() {
         "average",
         all(&totals),
         "tcp + udp; the rows above are subsets of these two",
-        elapsed,
+        measured,
     );
     print_summary(
         "TOTAL ENCRYPTED",
         "average encrypted",
         encrypted(&totals),
         "tls + quic + ssh + maybe_quic",
-        elapsed,
+        measured,
     );
+    let discarded = WARMUP_DISCARDED.load(Ordering::Relaxed);
+    if warmup != 0 {
+        println!("discarded {discarded} flows that arrived during the {warmup}s warmup");
+    }
+    if warmup != 0 && measured <= 0.0 {
+        println!(
+            "warning: the run ended before the {warmup}s warmup did, so nothing was \
+             measured; lower --warmup-secs or run for longer"
+        );
+    }
     let unfiled = UNFILED.load(Ordering::Relaxed);
     if unfiled != 0 {
         println!(
