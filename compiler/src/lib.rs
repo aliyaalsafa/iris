@@ -294,31 +294,15 @@ pub fn input_files(args: TokenStream, input: TokenStream) -> TokenStream {
 /// This must go in the main file of every binary target. Generally,
 /// putting it on the `main` function makes sense.
 #[proc_macro_attribute]
-pub fn iris_end_macros(args: TokenStream, input: TokenStream) -> TokenStream {
+pub fn iris_end_macros(_args: TokenStream, input: TokenStream) -> TokenStream {
     env_logger::init();
     println!("Done with macros - beginning code generation\n");
-
-    // The one accepted argument. An application that observes traffic through an
-    // `iris_core` packet tap rather than through subscriptions has no callbacks, and
-    // says so here so that everyone else still gets an error for a forgotten one.
-    let no_subscriptions = match args.to_string().trim() {
-        "" => false,
-        "no_subscriptions" => true,
-        other => panic!(
-            "unrecognized iris_end_macros argument {other:?}; the only option is \
-             `no_subscriptions`"
-        ),
-    };
 
     let input: proc_macro2::TokenStream = input.into();
 
     let decoder = {
         let mut inputs = cache::CACHED_DATA.lock().unwrap();
-        if no_subscriptions {
-            SubscriptionDecoder::new_without_subscriptions(inputs.as_mut())
-        } else {
-            SubscriptionDecoder::new(inputs.as_mut())
-        }
+        SubscriptionDecoder::new(inputs.as_mut())
     };
     let tracked_def = codegen::tracked_to_tokens(&decoder);
     let tracked_new = codegen::tracked_new_to_tokens(&decoder);
