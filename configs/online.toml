@@ -42,7 +42,7 @@ port = 9898
 [online.monitor.display]
 throughput = true
 mempool_usage = true
-# Per-second PCIe inbound byte counts for each port's root port, via Intel PCM.
+# Per-second PCIe inbound byte and transaction counts for each port's root port, via Intel PCM.
 # The socket/stack/part are derived from the [[online.ports]] PCI addresses.
 # Needs `pcm-iio` installed and root.
 pcie = true

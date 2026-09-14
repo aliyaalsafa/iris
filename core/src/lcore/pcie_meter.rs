@@ -11,6 +11,11 @@
 //! `[[online.ports]]` (see [`PcieTarget::derive`]), so no extra topology has to
 //! be spelled out in the config.
 //!
+//! Inbound transaction counts come from events the stock `pcm-iio` event file
+//! does not define: [`EventDir`] stages our own copy (`pcm/opCode-6-85.txt`) as
+//! `pcm-iio`'s working directory, which it reads before the installed one. On
+//! another CPU model that file is ignored, and only byte counts are reported.
+//!
 //! This is instrumentation only: if `pcm-iio` is missing or cannot open the
 //! MSRs (it needs root), we log once and the run continues without PCIe stats.
 
@@ -18,7 +23,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
@@ -26,10 +31,28 @@ use std::time::Instant;
 use anyhow::{anyhow, bail, Context, Result};
 use csv::Writer;
 
-/// Column indices used when the CSV header cannot be interpreted.
+/// Where each count sits in a `pcm-iio` CSV row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Columns {
+    write: usize,
+    read: usize,
+    write_txns: Option<usize>,
+    read_txns: Option<usize>,
+}
+
+/// Columns used when the CSV header cannot be interpreted.
 /// `Socket0,IIO Stack 2 - PCIe2,Part0 (...),<IB write>,<IB read>,...`
-const DEFAULT_WRITE_COL: usize = 3;
-const DEFAULT_READ_COL: usize = 4;
+const DEFAULT_COLUMNS: Columns = Columns {
+    write: 3,
+    read: 4,
+    write_txns: None,
+    read_txns: None,
+};
+
+/// `pcm-iio` event file adding inbound transaction counts, and the name `pcm-iio`
+/// looks for it under on Skylake-SP / Cascade Lake-SP.
+const EVENT_FILE_NAME: &str = "opCode-6-85.txt";
+const EVENT_FILE: &str = include_str!("pcm/opCode-6-85.txt");
 
 /// Where PCI topology is read from. Overridden by the tests.
 const SYSFS: &str = "/sys";
@@ -282,6 +305,10 @@ pub struct PcieSample {
     pub write_bytes: u64,
     /// Inbound (host <- device) read bytes, exactly as `pcm-iio` counted them.
     pub read_bytes: u64,
+    /// Inbound write transactions, or `None` if `pcm-iio` does not report them.
+    pub write_txns: Option<u64>,
+    /// Inbound read transactions, or `None` if `pcm-iio` does not report them.
+    pub read_txns: Option<u64>,
 }
 
 /// What the monitor prints for one target on a display tick.
@@ -294,6 +321,9 @@ pub struct PcieStats {
     pub started: bool,
     pub total_write_bytes: u64,
     pub total_read_bytes: u64,
+    /// `None` if `pcm-iio` does not report transaction counts.
+    pub total_write_txns: Option<u64>,
+    pub total_read_txns: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -303,6 +333,12 @@ struct Shared {
     read_bytes: AtomicU64,
     total_write_bytes: AtomicU64,
     total_read_bytes: AtomicU64,
+    /// Whether the `*_txns` fields below are backed by `pcm-iio` columns.
+    txns: AtomicBool,
+    write_txns: AtomicU64,
+    read_txns: AtomicU64,
+    total_write_txns: AtomicU64,
+    total_read_txns: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -320,6 +356,39 @@ pub struct PcieMeter {
     /// Sequence number last handed out per target, to spot stale samples.
     displayed: Vec<u64>,
     child: Child,
+    /// Declared after `child` so it outlives it; see [`EventDir`].
+    _event_dir: Option<EventDir>,
+}
+
+/// Private working directory for `pcm-iio` holding [`EVENT_FILE`], which it
+/// loads in preference to the installed event file. Removed on drop.
+#[derive(Debug)]
+struct EventDir(PathBuf);
+
+impl EventDir {
+    fn stage() -> Option<Self> {
+        let dir = EventDir(std::env::temp_dir().join(format!("iris-pcm-iio-{}", std::process::id())));
+        match fs::create_dir_all(&dir.0)
+            .and_then(|_| fs::write(dir.0.join(EVENT_FILE_NAME), EVENT_FILE))
+        {
+            Ok(()) => Some(dir),
+            Err(error) => {
+                log::error!(
+                    "PCIe monitor: cannot stage {} in {} ({}); transaction counts disabled",
+                    EVENT_FILE_NAME,
+                    dir.0.display(),
+                    error
+                );
+                None
+            }
+        }
+    }
+}
+
+impl Drop for EventDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 impl PcieMeter {
@@ -347,6 +416,10 @@ impl PcieMeter {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .stdin(Stdio::null());
+        let event_dir = EventDir::stage();
+        if let Some(dir) = &event_dir {
+            cmd.current_dir(&dir.0);
+        }
         crate::lcore::die_with_parent(&mut cmd);
 
         let mut child = match cmd.spawn() {
@@ -397,6 +470,7 @@ impl PcieMeter {
             targets: states,
             displayed,
             child,
+            _event_dir: event_dir,
         })
     }
 
@@ -411,16 +485,23 @@ impl PcieMeter {
             if fresh {
                 self.displayed[index] = seq;
             }
+            let shared = &state.shared;
+            let txns = shared.txns.load(Ordering::Relaxed);
+            let load_txns = |counter: &AtomicU64| txns.then(|| counter.load(Ordering::Relaxed));
             stats.push(PcieStats {
                 label: state.label.clone(),
                 sample: fresh.then(|| PcieSample {
                     seq,
-                    write_bytes: state.shared.write_bytes.load(Ordering::Relaxed),
-                    read_bytes: state.shared.read_bytes.load(Ordering::Relaxed),
+                    write_bytes: shared.write_bytes.load(Ordering::Relaxed),
+                    read_bytes: shared.read_bytes.load(Ordering::Relaxed),
+                    write_txns: load_txns(&shared.write_txns),
+                    read_txns: load_txns(&shared.read_txns),
                 }),
                 started: seq != 0,
-                total_write_bytes: state.shared.total_write_bytes.load(Ordering::Relaxed),
-                total_read_bytes: state.shared.total_read_bytes.load(Ordering::Relaxed),
+                total_write_bytes: shared.total_write_bytes.load(Ordering::Relaxed),
+                total_read_bytes: shared.total_read_bytes.load(Ordering::Relaxed),
+                total_write_txns: load_txns(&shared.total_write_txns),
+                total_read_txns: load_txns(&shared.total_read_txns),
             });
         }
         stats
@@ -468,6 +549,9 @@ fn open_log(path: &Path) -> Option<Writer<fs::File>> {
         "part",
         "ib_write_bytes",
         "ib_read_bytes",
+        // Empty when `pcm-iio` does not report transaction counts.
+        "ib_write_txns",
+        "ib_read_txns",
     ];
     match wtr
         .write_record(header)
@@ -482,8 +566,7 @@ fn open_log(path: &Path) -> Option<Writer<fs::File>> {
 }
 
 fn read_loop<R: BufRead>(reader: R, targets: &[TargetState], mut wtr: Option<Writer<fs::File>>) {
-    let mut write_col = DEFAULT_WRITE_COL;
-    let mut read_col = DEFAULT_READ_COL;
+    let mut columns = DEFAULT_COLUMNS;
     let mut logged_header = false;
     let mut logged_row = vec![false; targets.len()];
 
@@ -500,17 +583,18 @@ fn read_loop<R: BufRead>(reader: R, targets: &[TargetState], mut wtr: Option<Wri
 
         // Interval boundary: `pcm-iio` reprints the column header each round.
         if line.starts_with("Socket,Name") {
-            if let Some((w, r)) = header_columns(&line) {
-                write_col = w;
-                read_col = r;
+            if let Some(parsed) = header_columns(&line) {
+                columns = parsed;
             }
             if !logged_header {
-                log::info!(
-                    "PCIe header: {} (using columns {} write / {} read)",
-                    line.trim(),
-                    write_col,
-                    read_col
-                );
+                log::info!("PCIe header: {} (using {:?})", line.trim(), columns);
+                if columns.write_txns.is_none() || columns.read_txns.is_none() {
+                    log::warn!(
+                        "PCIe monitor: `pcm-iio` reports no inbound transaction counts; the \
+                         staged {} only applies to that CPU model",
+                        EVENT_FILE_NAME
+                    );
+                }
                 logged_header = true;
             }
             continue;
@@ -526,14 +610,13 @@ fn read_loop<R: BufRead>(reader: R, targets: &[TargetState], mut wtr: Option<Wri
                 logged_row[index] = true;
             }
 
-            let write_bytes = fields
-                .get(write_col)
-                .and_then(|f| parse_bytes(f))
-                .unwrap_or(0);
-            let read_bytes = fields
-                .get(read_col)
-                .and_then(|f| parse_bytes(f))
-                .unwrap_or(0);
+            let count_at = |col: usize| fields.get(col).and_then(|f| parse_bytes(f)).unwrap_or(0);
+            let write_bytes = count_at(columns.write);
+            let read_bytes = count_at(columns.read);
+            let (write_txns, read_txns) = match (columns.write_txns, columns.read_txns) {
+                (Some(w), Some(r)) => (Some(count_at(w)), Some(count_at(r))),
+                _ => (None, None),
+            };
 
             let shared = &state.shared;
             shared.write_bytes.store(write_bytes, Ordering::Relaxed);
@@ -544,6 +627,17 @@ fn read_loop<R: BufRead>(reader: R, targets: &[TargetState], mut wtr: Option<Wri
             shared
                 .total_read_bytes
                 .fetch_add(read_bytes, Ordering::Relaxed);
+            shared.txns.store(write_txns.is_some(), Ordering::Relaxed);
+            if let (Some(write_txns), Some(read_txns)) = (write_txns, read_txns) {
+                shared.write_txns.store(write_txns, Ordering::Relaxed);
+                shared.read_txns.store(read_txns, Ordering::Relaxed);
+                shared
+                    .total_write_txns
+                    .fetch_add(write_txns, Ordering::Relaxed);
+                shared
+                    .total_read_txns
+                    .fetch_add(read_txns, Ordering::Relaxed);
+            }
             // Publish last: a non-zero seq means every field above is readable.
             shared.seq.fetch_add(1, Ordering::Release);
 
@@ -556,6 +650,8 @@ fn read_loop<R: BufRead>(reader: R, targets: &[TargetState], mut wtr: Option<Wri
                     state.target.part.to_string(),
                     write_bytes.to_string(),
                     read_bytes.to_string(),
+                    write_txns.map(|n| n.to_string()).unwrap_or_default(),
+                    read_txns.map(|n| n.to_string()).unwrap_or_default(),
                 ];
                 if let Err(error) = wtr
                     .write_record(record)
@@ -578,22 +674,33 @@ fn read_loop<R: BufRead>(reader: R, targets: &[TargetState], mut wtr: Option<Wri
     }
 }
 
-/// Locate the inbound write / read columns from the CSV header, if it names them.
-fn header_columns(header: &str) -> Option<(usize, usize)> {
+/// Locate the inbound write / read byte columns from the CSV header, if it names
+/// them, along with the inbound transaction columns when present.
+fn header_columns(header: &str) -> Option<Columns> {
     let mut write = None;
     let mut read = None;
+    let mut write_txns = None;
+    let mut read_txns = None;
     for (idx, field) in header.split(',').enumerate() {
         let field = field.trim().to_ascii_lowercase();
-        if write.is_none() && field.contains("write") {
+        if field.contains("txns") {
+            if write_txns.is_none() && field.contains("write") {
+                write_txns = Some(idx);
+            } else if read_txns.is_none() && field.contains("read") {
+                read_txns = Some(idx);
+            }
+        } else if write.is_none() && field.contains("write") {
             write = Some(idx);
         } else if read.is_none() && field.contains("read") {
             read = Some(idx);
         }
     }
-    match (write, read) {
-        (Some(w), Some(r)) => Some((w, r)),
-        _ => None,
-    }
+    Some(Columns {
+        write: write?,
+        read: read?,
+        write_txns,
+        read_txns,
+    })
 }
 
 /// `"IIO Stack 2 - PCIe2"` matches stack 2 (but not stack 20).
@@ -733,6 +840,41 @@ mod tests {
     #[test]
     fn header_columns_by_name() {
         let header = "Socket,Name,Part,IB write,IB read,CPU read,CPU write";
-        assert_eq!(header_columns(header), Some((3, 4)));
+        assert_eq!(header_columns(header), Some(DEFAULT_COLUMNS));
+
+        let header = "Socket,Name,Part,IB write (bytes),IB read (bytes),IB write (txns),\
+                      IB read (txns),OB read (bytes),OB write (bytes),VT-d Mem Read";
+        assert_eq!(
+            header_columns(header),
+            Some(Columns {
+                write: 3,
+                read: 4,
+                write_txns: Some(5),
+                read_txns: Some(6),
+            })
+        );
+    }
+
+    #[test]
+    fn event_file_keeps_part_columns_contiguous() {
+        // Every Part event must precede the first Total-only event, or the Part1+
+        // rows stop lining up with the header (see the note in the event file).
+        let hnames: Vec<(&str, &str)> = EVENT_FILE
+            .lines()
+            .filter(|line| !line.contains('#') && line.contains('='))
+            .map(|line| {
+                let field = |key: &str| {
+                    line.split(',')
+                        .find_map(|item| item.strip_prefix(key))
+                        .unwrap()
+                };
+                (field("hname="), field("vname="))
+            })
+            .collect();
+        let first_total = hnames.iter().position(|(_, v)| *v == "Total").unwrap();
+        assert!(hnames[first_total..].iter().all(|(_, v)| *v == "Total"));
+        assert!(hnames[..first_total]
+            .iter()
+            .any(|(h, _)| *h == "IB write (txns)"));
     }
 }

@@ -651,8 +651,8 @@ pub struct DisplayConfig {
     #[serde(default = "default_display_mempool_usage")]
     pub mempool_usage: bool,
 
-    /// Display live PCIe inbound byte counts for each port's root port, sampled once a
-    /// second by Intel PCM's `pcm-iio`. Defaults to `false`.
+    /// Display live PCIe inbound byte and transaction counts for each port's root port,
+    /// sampled once a second by Intel PCM's `pcm-iio`. Defaults to `false`.
     ///
     /// ## Remarks
     /// The socket / IIO stack / part to read is derived from the PCI address of each
@@ -660,6 +660,9 @@ pub struct DisplayConfig {
     /// open the MSR/PCI devices it uses (i.e. run as root); if it cannot be started,
     /// PCIe statistics are skipped and the run continues. When logging is enabled,
     /// every sample is also written to `pcie.csv` in the log directory.
+    ///
+    /// Transaction counts use an event file Iris ships for Skylake-SP / Cascade Lake-SP
+    /// (CPU model 85); on other CPUs only byte counts are reported.
     #[serde(default = "default_display_pcie")]
     pub pcie: bool,
 

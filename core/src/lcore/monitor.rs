@@ -302,6 +302,24 @@ impl Monitor {
                     per_ingress_byte(stats.total_write_bytes),
                     per_ingress_byte(stats.total_read_bytes),
                 );
+                if let (Some(write_txns), Some(read_txns)) =
+                    (stats.total_write_txns, stats.total_read_txns)
+                {
+                    // "-" rather than 0.0 with no transactions: the ratio is undefined.
+                    let bytes_per_txn = |bytes: u64, txns: u64| match txns {
+                        0 => "-".to_string(),
+                        txns => format!("{:.1}", bytes as f64 / txns as f64),
+                    };
+                    println!(
+                        "PCIe {} (cumulative inbound): write {} txns / read {} txns; bytes per \
+                         txn: write {} / read {}",
+                        stats.label,
+                        write_txns,
+                        read_txns,
+                        bytes_per_txn(stats.total_write_bytes, write_txns),
+                        bytes_per_txn(stats.total_read_bytes, read_txns),
+                    );
+                }
             }
         }
 
@@ -398,11 +416,17 @@ impl Monitor {
             Some(pcie) => pcie,
             None => return,
         };
+        // Empty when `pcm-iio` does not report transaction counts.
+        let txns = |count: Option<u64>| count.map_or(String::new(), |n| format!(" ({} txns)", n));
         for stats in pcie.stats() {
             match stats.sample {
                 Some(sample) => println!(
-                    "PCIe {}: in-write {} bytes / in-read {} bytes",
-                    stats.label, sample.write_bytes, sample.read_bytes,
+                    "PCIe {}: in-write {} bytes{} / in-read {} bytes{}",
+                    stats.label,
+                    sample.write_bytes,
+                    txns(sample.write_txns),
+                    sample.read_bytes,
+                    txns(sample.read_txns),
                 ),
                 None if stats.started => println!("PCIe {}: no new sample", stats.label),
                 None => println!("PCIe {}: waiting for first sample", stats.label),

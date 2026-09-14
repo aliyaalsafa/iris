@@ -1,0 +1,45 @@
+# pcm-iio event file for Skylake-SP / Cascade Lake-SP (family 6, model 85), staged by
+# pcie_meter.rs as pcm-iio's working directory so it shadows the installed copy.
+#
+# This is the stock PCM file plus the inbound transaction-count events (TXN_REQ_OF_CPU,
+# ev_sel 0x84), the per-transaction twin of the per-byte DATA_REQ_OF_CPU (ev_sel 0x83).
+# They sit directly after the inbound byte events on purpose: pcm-iio numbers columns by
+# first appearance and each Part row only carries the events defined for it, so events
+# placed after the Total-only VT-d events would land at different field positions in the
+# Part1+ rows than the header says.
+#
+# Inbound (PCIe device DMA into system) payload events
+ctr=0,unit=iio,ev_sel=0x83,umask=0x1,en=1,ch_mask=1,fc_mask=0x7,multiplier=4,hname=IB write (bytes),vname=Part0 (1st x16/x8/x4)
+ctr=1,unit=iio,ev_sel=0x83,umask=0x1,en=1,ch_mask=2,fc_mask=0x7,multiplier=4,hname=IB write (bytes),vname=Part1 (2nd x4)
+ctr=0,unit=iio,ev_sel=0x83,umask=0x1,en=1,ch_mask=4,fc_mask=0x7,multiplier=4,hname=IB write (bytes),vname=Part2 (2nd x8/3rd x4)
+ctr=1,unit=iio,ev_sel=0x83,umask=0x1,en=1,ch_mask=8,fc_mask=0x7,multiplier=4,hname=IB write (bytes),vname=Part3 (4th x4)
+ctr=0,unit=iio,ev_sel=0x83,umask=0x4,en=1,ch_mask=1,fc_mask=0x7,multiplier=4,hname=IB read (bytes),vname=Part0 (1st x16/x8/x4)
+ctr=1,unit=iio,ev_sel=0x83,umask=0x4,en=1,ch_mask=2,fc_mask=0x7,multiplier=4,hname=IB read (bytes),vname=Part1 (2nd x4)
+ctr=0,unit=iio,ev_sel=0x83,umask=0x4,en=1,ch_mask=4,fc_mask=0x7,multiplier=4,hname=IB read (bytes),vname=Part2 (2nd x8/3rd x4)
+ctr=1,unit=iio,ev_sel=0x83,umask=0x4,en=1,ch_mask=8,fc_mask=0x7,multiplier=4,hname=IB read (bytes),vname=Part3 (4th x4)
+# Inbound (PCIe device DMA into system) transaction counts
+ctr=0,unit=iio,ev_sel=0x84,umask=0x1,en=1,ch_mask=1,fc_mask=0x7,multiplier=1,hname=IB write (txns),vname=Part0 (1st x16/x8/x4)
+ctr=1,unit=iio,ev_sel=0x84,umask=0x1,en=1,ch_mask=2,fc_mask=0x7,multiplier=1,hname=IB write (txns),vname=Part1 (2nd x4)
+ctr=0,unit=iio,ev_sel=0x84,umask=0x1,en=1,ch_mask=4,fc_mask=0x7,multiplier=1,hname=IB write (txns),vname=Part2 (2nd x8/3rd x4)
+ctr=1,unit=iio,ev_sel=0x84,umask=0x1,en=1,ch_mask=8,fc_mask=0x7,multiplier=1,hname=IB write (txns),vname=Part3 (4th x4)
+ctr=0,unit=iio,ev_sel=0x84,umask=0x4,en=1,ch_mask=1,fc_mask=0x7,multiplier=1,hname=IB read (txns),vname=Part0 (1st x16/x8/x4)
+ctr=1,unit=iio,ev_sel=0x84,umask=0x4,en=1,ch_mask=2,fc_mask=0x7,multiplier=1,hname=IB read (txns),vname=Part1 (2nd x4)
+ctr=0,unit=iio,ev_sel=0x84,umask=0x4,en=1,ch_mask=4,fc_mask=0x7,multiplier=1,hname=IB read (txns),vname=Part2 (2nd x8/3rd x4)
+ctr=1,unit=iio,ev_sel=0x84,umask=0x4,en=1,ch_mask=8,fc_mask=0x7,multiplier=1,hname=IB read (txns),vname=Part3 (4th x4)
+# Outbound (CPU MMIO to the PCIe device) payload events
+ctr=2,unit=iio,ev_sel=0xc0,umask=0x4,en=1,ch_mask=1,fc_mask=0x7,multiplier=4,hname=OB read (bytes),vname=Part0 (1st x16/x8/x4)
+ctr=3,unit=iio,ev_sel=0xc0,umask=0x4,en=1,ch_mask=2,fc_mask=0x7,multiplier=4,hname=OB read (bytes),vname=Part1 (2nd x4)
+ctr=2,unit=iio,ev_sel=0xc0,umask=0x4,en=1,ch_mask=4,fc_mask=0x7,multiplier=4,hname=OB read (bytes),vname=Part2 (2nd x8/3rd x4)
+ctr=3,unit=iio,ev_sel=0xc0,umask=0x4,en=1,ch_mask=8,fc_mask=0x7,multiplier=4,hname=OB read (bytes),vname=Part3 (4th x4)
+ctr=2,unit=iio,ev_sel=0xc0,umask=0x1,en=1,ch_mask=1,fc_mask=0x7,multiplier=4,hname=OB write (bytes),vname=Part0 (1st x16/x8/x4)
+ctr=3,unit=iio,ev_sel=0xc0,umask=0x1,en=1,ch_mask=2,fc_mask=0x7,multiplier=4,hname=OB write (bytes),vname=Part1 (2nd x4)
+ctr=2,unit=iio,ev_sel=0xc0,umask=0x1,en=1,ch_mask=4,fc_mask=0x7,multiplier=4,hname=OB write (bytes),vname=Part2 (2nd x8/3rd x4)
+ctr=3,unit=iio,ev_sel=0xc0,umask=0x1,en=1,ch_mask=8,fc_mask=0x7,multiplier=4,hname=OB write (bytes),vname=Part3 (4th x4)
+# VTd events
+ctr=0,unit=iio,ev_sel=0x41,umask=0x1,en=1,ch_mask=1,fc_mask=0x7,multiplier=1,hname=IOTLB Hit,vname=Total
+ctr=1,unit=iio,ev_sel=0x41,umask=0x20,en=1,ch_mask=1,fc_mask=0x7,multiplier=1,hname=IOTLB Miss,vname=Total
+ctr=2,unit=iio,ev_sel=0x41,umask=0x02,en=1,ch_mask=4,fc_mask=0x7,multiplier=1,hname=VT-d CTXT Miss,vname=Total
+ctr=3,unit=iio,ev_sel=0x41,umask=0x04,en=1,ch_mask=4,fc_mask=0x7,multiplier=1,hname=VT-d L1 Miss,vname=Total
+ctr=0,unit=iio,ev_sel=0x41,umask=0x08,en=1,ch_mask=4,fc_mask=0x7,multiplier=1,hname=VT-d L2 Miss,vname=Total
+ctr=1,unit=iio,ev_sel=0x41,umask=0x10,en=1,ch_mask=1,fc_mask=0x7,multiplier=1,hname=VT-d L3 Miss,vname=Total
+ctr=2,unit=iio,ev_sel=0x84,umask=0x04,en=1,ch_mask=0x10,fc_mask=0x7,multiplier=1,hname=VT-d Mem Read,vname=Total
