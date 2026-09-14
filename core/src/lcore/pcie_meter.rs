@@ -12,9 +12,9 @@
 //! be spelled out in the config.
 //!
 //! Inbound transaction counts come from events the stock `pcm-iio` event file
-//! does not define: [`EventDir`] stages our own copy (`pcm/opCode-6-85.txt`) as
+//! does not define: [`EventDir`] stages our own copies (see [`EVENT_FILES`]) as
 //! `pcm-iio`'s working directory, which it reads before the installed one. On
-//! another CPU model that file is ignored, and only byte counts are reported.
+//! another CPU model those files are ignored, and only byte counts are reported.
 //!
 //! This is instrumentation only: if `pcm-iio` is missing or cannot open the
 //! MSRs (it needs root), we log once and the run continues without PCIe stats.
@@ -49,10 +49,18 @@ const DEFAULT_COLUMNS: Columns = Columns {
     read_txns: None,
 };
 
-/// `pcm-iio` event file adding inbound transaction counts, and the name `pcm-iio`
-/// looks for it under on Skylake-SP / Cascade Lake-SP.
-const EVENT_FILE_NAME: &str = "opCode-6-85.txt";
-const EVENT_FILE: &str = include_str!("pcm/opCode-6-85.txt");
+/// `pcm-iio` event files adding inbound transaction counts on Skylake-SP /
+/// Cascade Lake-SP, each under the name a range of PCM releases looks for.
+///
+/// Both carry the same events in different formats. PCM 202502 and later read
+/// `opCode-<family>-<model>.txt` and need `unit=iio`; earlier releases (such as
+/// Ubuntu's 202307) read `opCode-<model>.txt` and take `divider=`. Each rejects
+/// the other's key and exits, so one file cannot serve both. Both are staged and
+/// each release opens only its own.
+const EVENT_FILES: [(&str, &str); 2] = [
+    ("opCode-6-85.txt", include_str!("pcm/opCode-6-85.txt")),
+    ("opCode-85.txt", include_str!("pcm/opCode-85.txt")),
+];
 
 /// Where PCI topology is read from. Overridden by the tests.
 const SYSFS: &str = "/sys";
@@ -360,7 +368,7 @@ pub struct PcieMeter {
     _event_dir: Option<EventDir>,
 }
 
-/// Private working directory for `pcm-iio` holding [`EVENT_FILE`], which it
+/// Private working directory for `pcm-iio` holding [`EVENT_FILES`], which it
 /// loads in preference to the installed event file. Removed on drop.
 #[derive(Debug)]
 struct EventDir(PathBuf);
@@ -368,14 +376,16 @@ struct EventDir(PathBuf);
 impl EventDir {
     fn stage() -> Option<Self> {
         let dir = EventDir(std::env::temp_dir().join(format!("iris-pcm-iio-{}", std::process::id())));
-        match fs::create_dir_all(&dir.0)
-            .and_then(|_| fs::write(dir.0.join(EVENT_FILE_NAME), EVENT_FILE))
-        {
+        let staged = fs::create_dir_all(&dir.0).and_then(|_| {
+            EVENT_FILES
+                .iter()
+                .try_for_each(|(name, contents)| fs::write(dir.0.join(name), contents))
+        });
+        match staged {
             Ok(()) => Some(dir),
             Err(error) => {
                 log::error!(
-                    "PCIe monitor: cannot stage {} in {} ({}); transaction counts disabled",
-                    EVENT_FILE_NAME,
+                    "PCIe monitor: cannot stage event files in {} ({}); transaction counts disabled",
                     dir.0.display(),
                     error
                 );
@@ -591,8 +601,7 @@ fn read_loop<R: BufRead>(reader: R, targets: &[TargetState], mut wtr: Option<Wri
                 if columns.write_txns.is_none() || columns.read_txns.is_none() {
                     log::warn!(
                         "PCIe monitor: `pcm-iio` reports no inbound transaction counts; the \
-                         staged {} only applies to that CPU model",
-                        EVENT_FILE_NAME
+                         staged event files only cover Skylake-SP / Cascade Lake-SP (model 85)"
                     );
                 }
                 logged_header = true;
@@ -856,25 +865,55 @@ mod tests {
     }
 
     #[test]
-    fn event_file_keeps_part_columns_contiguous() {
+    fn event_files_keep_part_columns_contiguous() {
         // Every Part event must precede the first Total-only event, or the Part1+
         // rows stop lining up with the header (see the note in the event file).
-        let hnames: Vec<(&str, &str)> = EVENT_FILE
-            .lines()
-            .filter(|line| !line.contains('#') && line.contains('='))
-            .map(|line| {
-                let field = |key: &str| {
+        for (name, contents) in EVENT_FILES {
+            let hnames: Vec<(&str, &str)> = contents
+                .lines()
+                .filter(|line| !line.contains('#') && line.contains('='))
+                .map(|line| {
+                    let field = |key: &str| {
+                        line.split(',')
+                            .find_map(|item| item.strip_prefix(key))
+                            .unwrap()
+                    };
+                    (field("hname="), field("vname="))
+                })
+                .collect();
+            let first_total = hnames.iter().position(|(_, v)| *v == "Total").unwrap();
+            assert!(hnames[first_total..].iter().all(|(_, v)| *v == "Total"), "{}", name);
+            assert!(
+                hnames[..first_total].iter().any(|(h, _)| *h == "IB write (txns)"),
+                "{}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn event_files_define_the_same_events() {
+        // Each PCM release exits on the other's format key, so each file must carry
+        // only its own; past that key, the two must not drift apart.
+        let events = |contents: &str, keep: &str, reject: &str| -> Vec<String> {
+            contents
+                .lines()
+                .filter(|line| !line.contains('#') && line.contains('='))
+                .map(|line| {
+                    assert!(line.contains(keep), "missing {} in {}", keep, line);
+                    assert!(!line.contains(reject), "unexpected {} in {}", reject, line);
                     line.split(',')
-                        .find_map(|item| item.strip_prefix(key))
-                        .unwrap()
-                };
-                (field("hname="), field("vname="))
-            })
-            .collect();
-        let first_total = hnames.iter().position(|(_, v)| *v == "Total").unwrap();
-        assert!(hnames[first_total..].iter().all(|(_, v)| *v == "Total"));
-        assert!(hnames[..first_total]
-            .iter()
-            .any(|(h, _)| *h == "IB write (txns)"));
+                        .filter(|item| !item.starts_with(keep))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .collect()
+        };
+        let [(new_name, new_file), (old_name, old_file)] = EVENT_FILES;
+        assert_eq!((new_name, old_name), ("opCode-6-85.txt", "opCode-85.txt"));
+        assert_eq!(
+            events(new_file, "unit=iio", "divider="),
+            events(old_file, "divider=1", "unit=")
+        );
     }
 }

@@ -1,5 +1,7 @@
 # pcm-iio event file for Skylake-SP / Cascade Lake-SP (family 6, model 85), staged by
 # pcie_meter.rs as pcm-iio's working directory so it shadows the installed copy.
+# This is the format PCM 202502 and later read (unit=iio, no divider=); opCode-85.txt
+# carries the same events for earlier releases. Keep the two in step.
 #
 # This is the stock PCM file plus the inbound transaction-count events (TXN_REQ_OF_CPU,
 # ev_sel 0x84), the per-transaction twin of the per-byte DATA_REQ_OF_CPU (ev_sel 0x83).
