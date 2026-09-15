@@ -5,7 +5,7 @@
 use iris_compiler::{datatype, datatype_fn};
 use iris_core::subscription::Tracked;
 use iris_core::L4Pdu;
-use serde::ser::{Serialize, SerializeSeq, SerializeStruct, Serializer};
+use serde::ser::{Serialize, SerializeStruct, Serializer};
 use std::time::{Duration, Instant};
 
 /// Tracks the start (first packet seen) and end (last packet seen)
@@ -221,10 +221,11 @@ pub struct InterArrivals {
     pkt_count_stoc: usize,
     last_pkt_ctos: Instant,
     last_pkt_stoc: Instant,
-    pub interarrivals_ctos: Vec<Duration>,
-    /// Interarrival durations server-to-client (resp.) flow
-    pub interarrivals_stoc: Vec<Duration>,
+    /// Interarrival statistics client-to-server (orig.) flow. Only running statistics are
+    /// kept: a per-packet history grows for the life of the connection.
     pub stats_ctos: IatStats,
+    /// Interarrival statistics server-to-client (resp.) flow
+
     pub stats_stoc: IatStats,
 }
 
@@ -236,8 +237,6 @@ impl InterArrivals {
             pkt_count_stoc: 0,
             last_pkt_ctos: now,
             last_pkt_stoc: now,
-            interarrivals_ctos: Vec::new(),
-            interarrivals_stoc: Vec::new(),
             stats_ctos: IatStats::new(),
             stats_stoc: IatStats::new(),
         }
@@ -255,17 +254,13 @@ impl InterArrivals {
         if pdu.dir {
             self.pkt_count_ctos += 1;
             if self.pkt_count_ctos > 1 {
-                let iat = now - self.last_pkt_ctos;
-                self.interarrivals_ctos.push(iat);
-                self.stats_ctos.push(iat);
+                self.stats_ctos.push(now - self.last_pkt_ctos);
             }
             self.last_pkt_ctos = now;
         } else {
             self.pkt_count_stoc += 1;
             if self.pkt_count_stoc > 1 {
-                let iat = now - self.last_pkt_stoc;
-                self.interarrivals_stoc.push(iat);
-                self.stats_stoc.push(iat);
+                self.stats_stoc.push(now - self.last_pkt_stoc);
             }
             self.last_pkt_stoc = now;
         }
@@ -279,24 +274,25 @@ impl Tracked for InterArrivals {
 
     #[inline]
     fn clear(&mut self) {
-        self.interarrivals_ctos.clear();
-        self.interarrivals_stoc.clear();
         self.stats_ctos.clear();
         self.stats_stoc.clear();
     }
 }
 
-struct DurationVec<'a>(&'a Vec<Duration>);
-impl Serialize for DurationVec<'_> {
+/// (mean, min, max, std) in microseconds; see [`IatStats::summary`].
+struct IatSummary<'a>(&'a IatStats);
+impl Serialize for IatSummary<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
-        for dur in self.0 {
-            seq.serialize_element(&dur.as_nanos())?;
-        }
-        seq.end()
+        let (mean, min, max, std) = self.0.summary();
+        let mut state = serializer.serialize_struct("IatSummary", 4)?;
+        state.serialize_field("mean_us", &mean)?;
+        state.serialize_field("min_us", &min)?;
+        state.serialize_field("max_us", &max)?;
+        state.serialize_field("std_us", &std)?;
+        state.end()
     }
 }
 
@@ -305,9 +301,9 @@ impl Serialize for InterArrivals {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("InterArrivals", 4)?;
-        state.serialize_field("interarrivals_ctos", &DurationVec(&self.interarrivals_ctos))?;
-        state.serialize_field("interarrivals_stoc", &DurationVec(&self.interarrivals_stoc))?;
+        let mut state = serializer.serialize_struct("InterArrivals", 2)?;
+        state.serialize_field("interarrivals_ctos", &IatSummary(&self.stats_ctos))?;
+        state.serialize_field("interarrivals_stoc", &IatSummary(&self.stats_stoc))?;
         state.end()
     }
 }
