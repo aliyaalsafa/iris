@@ -11,7 +11,7 @@
 //!   tls / quic / ssh     whatever the L7 parsers claim, at `L7OnDisc`
 //!   maybe_quic           mid-stream QUIC the parsers miss, by heuristic
 //!
-//! Two further columns, `active_tuples_directional` and `active_tuples_bidirectional`,
+//! Two further columns, `unique_tuples_directional_<w>s` and its bidirectional twin,
 //! answer a deliberately *different* question, and the difference is the point of
 //! having them here. Every series above is scoped to a connection, so it inherits
 //! conntrack's blind spots -- most of all that a TCP connection is only built from a
@@ -20,11 +20,20 @@
 //! ahead of the software flow table and the generated packet filter. The gap between
 //! them is what connection tracking discards.
 //!
-//! They are *observation* counts, not arrivals: a tuple is credited to every second in
-//! which it sent a packet, so a ten-second flow appears in ten buckets. They therefore
-//! do not sum down the column, and a row does not invite an arrivals-vs-tuples
-//! subtraction. Getting a packet-level *arrival* rate would need a "have I seen this
-//! before" structure rather than a cardinality sketch.
+//! Three things to keep straight about them:
+//!
+//! - They are counted over a whole `--tuple-window-secs` window (10 by default), not
+//!   per second. Every row inside a window carries that window's value, and
+//!   `tuple_window` identifies which; take one row per window for the compact series.
+//! - They are *observation* counts, not arrivals: a tuple is counted in every window it
+//!   appears in, so a 30-second flow lands in three or four of them. They do not sum
+//!   down the column, and a row does not invite an arrivals-minus-tuples subtraction.
+//!   A packet-level *arrival* rate would need a "have I seen this before" structure
+//!   rather than a cardinality sketch.
+//! - Windows are nested, not independent samples. A 10s window sees a superset of what
+//!   any one of its seconds sees, so dividing a 10s count by 10 gives something
+//!   strictly larger than the per-second unique count. Widening the window raises the
+//!   number; that is the definition working, not drift.
 //!
 //! A live line goes to stdout every `--print-interval` seconds; the full per-second
 //! series — a column per category plus `all` — is written to `--csv` at shutdown.
@@ -63,6 +72,8 @@
 //!   `1.04/sqrt(2^p)` -- 1.6% at the default `--tuple-precision 12`. Sketches merge
 //!   exactly across cores, so a flow whose two directions land on different RX cores
 //!   under non-symmetric RSS is still counted once in the bidirectional column.
+//! - The final window of a run is usually short, so its count is not comparable to the
+//!   others. The summary says by how much.
 //! - The tap cannot see two things, both by construction: traffic steered to a sink
 //!   queue (`rx_sink` is a drain, not part of the pipeline), and packets a hardware
 //!   `rte_flow` rule dropped, which never reach `rte_eth_rx_burst`.
@@ -156,9 +167,32 @@ impl CoreBuckets {
 const TUP_DIR: usize = 0;
 const TUP_BIDIR: usize = 1;
 const NTUP: usize = 2;
-const TUP_NAMES: [&str; NTUP] = ["active_tuples_directional", "active_tuples_bidirectional"];
+const TUP_KINDS: [&str; NTUP] = ["directional", "bidirectional"];
 
-/// One core's tuple sketches, laid out `[second][series][register]` in one allocation.
+/// Seconds per tuple-counting window (`--tuple-window-secs`). Unique tuples are counted
+/// over a whole window, not per second.
+static TUP_WINDOW: OnceLock<usize> = OnceLock::new();
+
+#[inline]
+fn tup_window() -> usize {
+    *TUP_WINDOW.get().unwrap_or(&10)
+}
+
+/// CSV/report column name, carrying the window so a header can never imply per-second.
+fn tup_name(kind: usize) -> String {
+    format!("unique_tuples_{}_{}s", TUP_KINDS[kind], tup_window())
+}
+
+/// Which window a measured second belongs to.
+#[inline]
+fn window_of(sec: usize) -> usize {
+    sec / tup_window()
+}
+
+/// One core's tuple sketches, laid out `[window][series][register]` in one allocation.
+///
+/// Indexed by *window*, not second, so a ten-second window costs a tenth of the
+/// registers -- which is what makes a higher `--tuple-precision` affordable here.
 ///
 /// The single slab is not just tidiness. Allocating each 4 KiB sketch separately makes
 /// the whole grid resident at startup, because glibc serves anything under its 128 KiB
@@ -169,18 +203,19 @@ const TUP_NAMES: [&str; NTUP] = ["active_tuples_directional", "active_tuples_bid
 /// Written only by the owning core's RX thread, like [`CoreBuckets`].
 #[repr(align(64))]
 struct CoreSketches {
-    secs: Box<[AtomicU8]>,
-    /// Packets with no five-tuple -- ARP, ICMP, malformed -- per second. Exact.
+    windows: Box<[AtomicU8]>,
+    /// Packets with no five-tuple -- ARP, ICMP, malformed -- per second. Exact, and kept
+    /// per second rather than per window because it costs nothing and loses nothing.
     unparsed: Box<[AtomicU64]>,
     /// Registers per sketch, i.e. `2^p`.
     m: usize,
 }
 
 impl CoreSketches {
-    fn new(nsecs: usize, p: u32) -> Self {
+    fn new(nsecs: usize, nwindows: usize, p: u32) -> Self {
         let m = 1usize << p;
         Self {
-            secs: hll::zeroed(nsecs * NTUP * m),
+            windows: hll::zeroed(nwindows * NTUP * m),
             unparsed: (0..nsecs)
                 .map(|_| AtomicU64::new(0))
                 .collect::<Vec<_>>()
@@ -189,12 +224,12 @@ impl CoreSketches {
         }
     }
 
-    /// This core's sketches for `sec`, one per series back to back, or `None` past the
-    /// end of the grid. Split with `chunks_exact(self.m)`.
+    /// This core's sketches for `window`, one per series back to back, or `None` past
+    /// the end of the grid. Split with `chunks_exact(self.m)`.
     #[inline]
-    fn sec(&self, sec: usize) -> Option<&[AtomicU8]> {
+    fn window(&self, window: usize) -> Option<&[AtomicU8]> {
         let width = NTUP * self.m;
-        self.secs.get(sec * width..(sec + 1) * width)
+        self.windows.get(window * width..(window + 1) * width)
     }
 }
 
@@ -211,8 +246,12 @@ fn sketches() -> &'static Vec<CoreSketches> {
     SKETCHES.get().expect("sketches() before init_sketches()")
 }
 
-fn init_sketches(ncores: usize, nsecs: usize, p: u32) {
-    let _ = SKETCHES.set((0..ncores).map(|_| CoreSketches::new(nsecs, p)).collect());
+fn init_sketches(ncores: usize, nsecs: usize, nwindows: usize, p: u32) {
+    let _ = SKETCHES.set(
+        (0..ncores)
+            .map(|_| CoreSketches::new(nsecs, nwindows, p))
+            .collect(),
+    );
 }
 
 /// Observe one packet. Installed as an [`iris_core::lcore::packet_tap`], so it runs
@@ -245,7 +284,7 @@ fn observe_packet(mbuf: &Mbuf, core_id: &CoreId, now: Instant) {
         return;
     };
 
-    let Some(block) = core.sec(sec) else {
+    let Some(block) = core.window(window_of(sec)) else {
         UNFILED_PKTS.fetch_add(1, Ordering::Relaxed);
         return;
     };
@@ -262,21 +301,27 @@ fn observe_packet(mbuf: &Mbuf, core_id: &CoreId, now: Instant) {
     }
 }
 
-/// Merge one second's sketches across every core, then estimate.
+/// Merge one window's sketches across every core, then estimate.
 ///
 /// Merging before estimating is what makes the cross-core case correct: the two
 /// directions of a flow can land on different RX cores under non-symmetric RSS, and
 /// register-wise max collapses them. Summing per-core estimates would double-count.
-fn tuple_estimates(sec: usize) -> [f64; NTUP] {
+fn tuple_estimates(window: usize) -> [f64; NTUP] {
     std::array::from_fn(|series| {
         let mut acc = vec![0u8; sketches()[0].m];
         for core in sketches() {
-            if let Some(block) = core.sec(sec) {
+            if let Some(block) = core.window(window) {
                 hll::merge_into(&block[series * core.m..(series + 1) * core.m], &mut acc);
             }
         }
         hll::estimate(&acc)
     })
+}
+
+/// Number of windows the grid holds.
+fn nwindows() -> usize {
+    let m = sketches()[0].m;
+    sketches()[0].windows.len() / (NTUP * m)
 }
 
 fn unparsed_in(sec: usize) -> u64 {
@@ -598,9 +643,16 @@ struct Args {
     #[clap(long)]
     max_seconds: Option<usize>,
 
-    /// HyperLogLog precision for the `active_tuples_*` columns: 2^p one-byte registers
-    /// per sketch, per core, per second. The relative standard error is 1.04/sqrt(2^p),
-    /// so 12 gives 1.6% from 4 KiB.
+    /// Seconds per window for the `unique_tuples_*` columns. A tuple is counted once per
+    /// window it appears in, so a longer window counts more unique tuples -- the
+    /// windows are nested, not independent samples.
+    #[clap(long, default_value = "10")]
+    tuple_window_secs: usize,
+
+    /// HyperLogLog precision for the `unique_tuples_*` columns: 2^p one-byte registers
+    /// per sketch, per core, per window. The relative standard error is 1.04/sqrt(2^p),
+    /// so 12 gives 1.6% from 4 KiB. A 10s window needs a tenth of the sketches a 1s
+    /// window did, so 14 (0.81%) costs less here than 12 used to.
     #[clap(long, default_value = "12")]
     tuple_precision: u32,
 
@@ -613,10 +665,10 @@ struct Args {
 /// Live line: cumulative total per category, and the mean rate over the interval just
 /// elapsed.
 ///
-/// `last_tuples` is the newest *complete* second of the observed-tuple series rather
-/// than a cumulative figure, because sketches cannot be differenced: the run-so-far
-/// union minus the union one second ago is a difference of two large estimates, and at
-/// any real cardinality the noise swamps the answer.
+/// `last_tuples` is the newest *complete* window of the unique-tuple series rather than
+/// a cumulative figure, because sketches cannot be differenced: the run-so-far union
+/// minus the union one window ago is a difference of two large estimates, and at any
+/// real cardinality the noise swamps the answer.
 fn print_live(
     elapsed: Duration,
     prev: &[u64; NCAT],
@@ -629,12 +681,15 @@ fn print_live(
         let rate = (curr[cat] - prev[cat]) as f64 / interval_secs;
         line += &format!(" {}={} ({:.0}/s)", CAT_NAMES[cat], curr[cat], rate);
     }
-    if let Some((sec, est)) = last_tuples {
-        line += &format!(" | sec {sec}");
+    if let Some((window, est)) = last_tuples {
+        let w = tup_window();
+        line += &format!(
+            " | unique tuples in s{}-{}",
+            window * w,
+            (window + 1) * w - 1
+        );
         for tup in 0..NTUP {
-            // Trim the shared prefix; the header above names them in full.
-            let short = TUP_NAMES[tup].trim_start_matches("active_tuples_");
-            line += &format!(" active_{short}={:.0}", est[tup]);
+            line += &format!(" {}={:.0}", TUP_KINDS[tup], est[tup]);
         }
     }
     println!("{line}");
@@ -666,16 +721,28 @@ fn totals(series: &[[u64; NCAT]]) -> [u64; NCAT] {
 /// cumulative is a prefix sum away, so it is left to whatever reads this.
 ///
 /// `second` counts from the end of warmup, so row 0 is the first measured second.
-/// The `active_tuples_*` columns come last and mean something different from the rest
-/// of the row: they are distinct five-tuples *observed* in that second, from the packet
-/// tap, not flows that *arrived* in it. `unparsed_packets` is an exact count of tapped
-/// packets with no five-tuple at all.
-fn write_csv(path: &PathBuf, series: &[[u64; NCAT]]) -> std::io::Result<usize> {
-    let tuples: Vec<([f64; NTUP], u64)> = (0..series.len())
-        .map(|sec| (tuple_estimates(sec), unparsed_in(sec)))
-        .collect();
-    let active = |sec: usize| tuples[sec].0.iter().any(|&v| v > 0.0) || tuples[sec].1 > 0;
-    let last = (0..series.len())
+///
+/// The last columns are on a different time base from the rest of the row, and the
+/// header says so. `tuple_window` is the index of the enclosing `--tuple-window-secs`
+/// window, and `unique_tuples_*_<w>s` is the count of distinct five-tuples *observed*
+/// anywhere in that whole window, from the packet tap -- not flows that *arrived* in
+/// this second. The value is therefore the same on every row of a window; take one row
+/// per `tuple_window` (e.g. `groupby('tuple_window').first()`) to get the compact
+/// series, and never sum it down the column. `unparsed_packets` is back on the
+/// per-second base, and is an exact count rather than an estimate.
+fn write_csv(
+    path: &PathBuf,
+    series: &[[u64; NCAT]],
+    measured_secs: usize,
+) -> std::io::Result<usize> {
+    let per_window: Vec<[f64; NTUP]> = (0..nwindows()).map(tuple_estimates).collect();
+    let tuples = |sec: usize| per_window.get(window_of(sec)).copied().unwrap_or_default();
+    let active = |sec: usize| tuples(sec).iter().any(|&v| v > 0.0) || unparsed_in(sec) > 0;
+    // Capped at the measured seconds. A window's tuple value marks every second of that
+    // window active, which past the end of the run would invent rows for seconds that
+    // never happened.
+    let end = series.len().min(measured_secs);
+    let last = (0..end)
         .rposition(|sec| series[sec].iter().any(|&v| v != 0) || active(sec))
         .map_or(0, |i| i + 1);
 
@@ -684,9 +751,9 @@ fn write_csv(path: &PathBuf, series: &[[u64; NCAT]]) -> std::io::Result<usize> {
     for name in CAT_NAMES {
         write!(w, ",{name}")?;
     }
-    write!(w, ",all,encrypted")?;
-    for name in TUP_NAMES {
-        write!(w, ",{name}")?;
+    write!(w, ",all,encrypted,tuple_window")?;
+    for tup in 0..NTUP {
+        write!(w, ",{}", tup_name(tup))?;
     }
     writeln!(w, ",unparsed_packets")?;
 
@@ -695,12 +762,11 @@ fn write_csv(path: &PathBuf, series: &[[u64; NCAT]]) -> std::io::Result<usize> {
         for count in row {
             write!(w, ",{count}")?;
         }
-        write!(w, ",{},{}", all(row), encrypted(row))?;
-        let (est, unparsed) = &tuples[sec];
-        for v in est {
+        write!(w, ",{},{},{}", all(row), encrypted(row), window_of(sec))?;
+        for v in tuples(sec) {
             write!(w, ",{v:.0}")?;
         }
-        writeln!(w, ",{unparsed}")?;
+        writeln!(w, ",{}", unparsed_in(sec))?;
     }
     w.flush()?;
     Ok(last)
@@ -738,26 +804,31 @@ fn main() {
         hll::MIN_PRECISION,
         hll::MAX_PRECISION
     );
+    let window = args.tuple_window_secs;
+    assert!(window >= 1, "--tuple-window-secs must be at least 1");
+    TUP_WINDOW.set(window).expect("TUP_WINDOW already set");
+    let nwin = nsecs.div_ceil(window);
+
     // Reserved address space, not resident memory: the slabs are handed back as
-    // untouched zero pages and fault in only as seconds are written.
-    let reserve = ncores * nsecs * NTUP * (1usize << p);
+    // untouched zero pages and fault in only as windows are written.
+    let reserve = ncores * nwin * NTUP * (1usize << p);
     let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
     assert!(
         mib(reserve) <= args.max_reserve_mib as f64,
         "tuple sketches would reserve {:.1} MiB, over the {} MiB limit; lower \
-         --max-seconds or --tuple-precision, or raise --max-reserve-mib",
+         --max-seconds or --tuple-precision, raise --tuple-window-secs, or raise \
+         --max-reserve-mib",
         mib(reserve),
         args.max_reserve_mib
     );
     println!(
-        "flow_arrivals: tuple sketches p={p} (m={}, sigma={:.2}%), {:.1} MiB reserved, \
-         ~{:.0} KiB/s resident",
+        "flow_arrivals: unique tuples over {window}s windows, p={p} (m={}, \
+         sigma={:.2}%), {nwin} windows x {ncores} cores = {:.1} MiB reserved",
         1usize << p,
         hll::std_error(p) * 100.0,
         mib(reserve),
-        (ncores * NTUP * (1usize << p)) as f64 / 1024.0,
     );
-    init_sketches(ncores, nsecs, p);
+    init_sketches(ncores, nsecs, nwin, p);
 
     let interval = Duration::from_secs(args.print_interval.max(1));
     let warmup_dur = Duration::from_secs(warmup);
@@ -785,11 +856,11 @@ fn main() {
                 continue;
             }
             let curr = totals(&collect());
-            // The second before the current one, i.e. the newest complete bucket.
-            let last_tuples = ((elapsed - warmup_dur).as_secs() as usize)
+            // The window before the current one, i.e. the newest complete one.
+            let last_tuples = window_of((elapsed - warmup_dur).as_secs() as usize)
                 .checked_sub(1)
-                .filter(|&s| s < nsecs)
-                .map(|s| (s, tuple_estimates(s)));
+                .filter(|&win| win < nwin)
+                .map(|win| (win, tuple_estimates(win)));
             // The actual gap, not the nominal interval: waking on a 250ms granularity
             // overshoots a little every time, and that drift would skew the rate.
             print_live(
@@ -838,19 +909,19 @@ fn main() {
         "tls + quic + ssh + maybe_quic",
         measured,
     );
-    // The observed-tuple series, summarised as its per-second mean. There is
-    // deliberately no run total here: a tuple is credited to every second it was active
-    // in, so the column does not sum to anything meaningful, and the sketches cannot be
-    // unioned into a run-wide figure without answering a different question ("distinct
-    // tuples all run") than the column does.
+    // The unique-tuple series, per window. There is deliberately no run total: a tuple
+    // is counted once in every window it appears in, so the column does not sum to
+    // anything meaningful, and unioning the sketches run-wide would answer a different
+    // question ("distinct tuples all run") than the column does.
     let measured_secs = (measured.ceil() as usize).min(nsecs);
-    let tuple_rows: Vec<[f64; NTUP]> = (0..measured_secs).map(tuple_estimates).collect();
+    let measured_windows = (window_of(measured_secs.saturating_sub(1)) + 1).min(nwin);
+    let tuple_rows: Vec<[f64; NTUP]> = (0..measured_windows).map(tuple_estimates).collect();
     let nonempty = tuple_rows
         .iter()
         .filter(|r| r.iter().any(|&v| v > 0.0))
         .count();
     let plural = if nonempty == 1 { "" } else { "s" };
-    println!("\n--- tuples observed per second (not arrivals; see note below) ---");
+    println!("\n--- unique five-tuples per {window}s window (not arrivals; see notes) ---");
     for tup in 0..NTUP {
         let sum: f64 = tuple_rows.iter().map(|r| r[tup]).sum();
         let mean = if nonempty == 0 {
@@ -859,8 +930,19 @@ fn main() {
             sum / nonempty as f64
         };
         println!(
-            "{:>20}  {mean:.0} /s mean over {nonempty} active second{plural}",
-            TUP_NAMES[tup].trim_start_matches("active_tuples_")
+            "{:>20}  {mean:.0} mean per window over {nonempty} active window{plural}",
+            TUP_KINDS[tup]
+        );
+    }
+    // Per-window counts only compare when the windows cover equal time. The last one
+    // usually does not, so say how short it is rather than let it drag the mean down
+    // unremarked.
+    let tail = measured_secs % window;
+    if tail != 0 && nonempty > 0 {
+        println!(
+            "{:>20}  the last window covers {tail}s of {window}s, so its count is not \
+             comparable to the others",
+            "partial window"
         );
     }
     let tapped = TAPPED.load(Ordering::Relaxed);
@@ -903,11 +985,16 @@ fn main() {
          flows do too, so the last few seconds of those are still filling in"
     );
     println!(
-        "note: active_tuples_* count tuples *observed* in a second, not arriving in it, \
-         so they do not sum and are not comparable row-wise to the arrival columns"
+        "note: unique_tuples_* count distinct tuples *observed* anywhere in a {window}s \
+         window, not arriving in one second, so they do not sum down the column and are \
+         not comparable row-wise to the arrival columns"
+    );
+    println!(
+        "note: windows are nested, not independent -- dividing a {window}s count by \
+         {window} does NOT give the per-second unique count, which is lower"
     );
 
-    match write_csv(&args.csv, &series) {
+    match write_csv(&args.csv, &series, measured_secs) {
         Ok(rows) => println!("wrote {rows} per-second rows to {}", args.csv.display()),
         Err(e) => eprintln!("failed to write {}: {e}", args.csv.display()),
     }
@@ -926,76 +1013,106 @@ mod tests {
     /// One test, not several: `SKETCHES` and `BUCKETS` are process-wide `OnceLock`s, so
     /// only one test can own them.
     #[test]
-    fn tuple_grid_merges_cores_and_extends_the_csv() {
+    fn tuple_windows_merge_cores_and_repeat_across_the_csv() {
         const NCORES: usize = 4;
-        const NSECS: usize = 10;
+        const NSECS: usize = 30;
+        const WINDOW: usize = 10;
+        const NWIN: usize = 3;
 
-        init_sketches(NCORES, NSECS, 12);
+        TUP_WINDOW.set(WINDOW).expect("TUP_WINDOW already set");
+        init_sketches(NCORES, NSECS, NWIN, 12);
         init_buckets(NCORES, NSECS);
 
+        // Seconds map onto windows, and the boundary is where off-by-ones live.
+        assert_eq!(window_of(0), 0);
+        assert_eq!(window_of(9), 0);
+        assert_eq!(window_of(10), 1);
+        assert_eq!(window_of(29), 2);
+
         let key = |i: u64| hll::fmix64(i);
-        let slot = |core: usize, sec: usize, series: usize| {
+        let slot = |core: usize, win: usize, series: usize| {
             let c = &sketches()[core];
-            &c.sec(sec).expect("slot in range")[series * c.m..(series + 1) * c.m]
+            &c.window(win).expect("slot in range")[series * c.m..(series + 1) * c.m]
         };
 
-        // Second 2: 500 distinct tuples, split across two cores with no overlap.
+        // Window 0: 500 distinct tuples, split across two cores with no overlap.
         for i in 0..500u64 {
-            hll::add(slot((i % 2) as usize, 2, TUP_DIR), key(i));
+            hll::add(slot((i % 2) as usize, 0, TUP_DIR), key(i));
         }
 
-        // Second 5: the *same* 300 tuples observed on two different cores, which is
+        // Window 1: the *same* 300 tuples observed on two different cores, which is
         // what non-symmetric RSS does to a flow's two directions. Register-wise max
         // must collapse them; summing per-core estimates would report ~600.
         for i in 1000..1300u64 {
-            hll::add(slot(0, 5, TUP_BIDIR), key(i));
-            hll::add(slot(3, 5, TUP_BIDIR), key(i));
+            hll::add(slot(0, 1, TUP_BIDIR), key(i));
+            hll::add(slot(3, 1, TUP_BIDIR), key(i));
         }
 
-        // Second 7: unparsed packets only, no five-tuples at all.
-        sketches()[1].unparsed[7].store(42, Ordering::Relaxed);
+        // Second 25 (window 2): unparsed packets only, no five-tuples at all.
+        sketches()[1].unparsed[25].store(42, Ordering::Relaxed);
 
         let tol = |n: f64| 3.0 * 0.0181 * n; // 3 sigma, linear-counting regime
 
-        let s2 = tuple_estimates(2);
+        let w0 = tuple_estimates(0);
         assert!(
-            (s2[TUP_DIR] - 500.0).abs() < tol(500.0),
-            "second 2 directional estimated {}, want ~500",
-            s2[TUP_DIR]
+            (w0[TUP_DIR] - 500.0).abs() < tol(500.0),
+            "window 0 directional estimated {}, want ~500",
+            w0[TUP_DIR]
         );
-        assert_eq!(s2[TUP_BIDIR], 0.0, "second 2 wrote nothing bidirectional");
+        assert_eq!(w0[TUP_BIDIR], 0.0, "window 0 wrote nothing bidirectional");
 
-        let s5 = tuple_estimates(5);
+        let w1 = tuple_estimates(1);
         assert!(
-            (s5[TUP_BIDIR] - 300.0).abs() < tol(300.0),
-            "second 5 bidirectional estimated {}, want ~300 -- the same tuple on two \
+            (w1[TUP_BIDIR] - 300.0).abs() < tol(300.0),
+            "window 1 bidirectional estimated {}, want ~300 -- the same tuple on two \
              cores must merge, not double",
-            s5[TUP_BIDIR]
+            w1[TUP_BIDIR]
         );
 
-        // Untouched seconds must read exactly zero, not `alpha * m`.
-        for sec in [0usize, 1, 3, 4, 6, 8, 9] {
-            assert_eq!(tuple_estimates(sec), [0.0; NTUP], "second {sec}");
-        }
-        assert_eq!(unparsed_in(7), 42);
-        assert_eq!(unparsed_in(6), 0);
+        // An untouched window must read exactly zero, not `alpha * m`.
+        assert_eq!(tuple_estimates(2), [0.0; NTUP]);
+        assert_eq!(unparsed_in(25), 42);
+        assert_eq!(unparsed_in(24), 0);
 
         // The CSV must extend past the last *flow* arrival to cover seconds that only
-        // the tap saw -- here second 7, which holds nothing but unparsed packets.
+        // the tap saw -- here second 25, which holds nothing but unparsed packets.
         let series = vec![[0u64; NCAT]; NSECS];
         let path = std::env::temp_dir().join("flow_arrivals_tuple_test.csv");
-        assert_eq!(write_csv(&path, &series).expect("write csv"), 8);
+        assert_eq!(write_csv(&path, &series, NSECS).expect("write csv"), 26);
         let csv = std::fs::read_to_string(&path).expect("read csv");
         let lines: Vec<&str> = csv.lines().collect();
-        assert_eq!(lines.len(), 9, "header plus seconds 0..=7");
+        assert_eq!(lines.len(), 27, "header plus seconds 0..=25");
         assert!(
             lines[0].ends_with(
-                ",active_tuples_directional,active_tuples_bidirectional,unparsed_packets"
+                ",tuple_window,unique_tuples_directional_10s,\
+                 unique_tuples_bidirectional_10s,unparsed_packets"
             ),
-            "tuple columns come last: {}",
+            "tuple columns come last and carry the window: {}",
             lines[0]
         );
-        assert!(lines[8].ends_with(",0,0,42"), "second 7 row: {}", lines[8]);
+
+        // A window's value repeats on every one of its rows, so seconds 0 and 9 agree
+        // and second 10 belongs to the next window.
+        let tail = |line: &str| {
+            line.rsplit(',')
+                .take(4)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        assert_eq!(
+            tail(lines[1]),
+            tail(lines[10]),
+            "seconds 0 and 9 share window 0"
+        );
+        assert!(tail(lines[11]).starts_with("1,"), "second 10 is window 1");
+        assert!(
+            lines[26].ends_with(",2,0,0,42"),
+            "second 25 row: {}",
+            lines[26]
+        );
         let _ = std::fs::remove_file(&path);
     }
 }
