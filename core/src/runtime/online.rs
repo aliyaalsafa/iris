@@ -26,6 +26,7 @@ where
     monitor: Option<Monitor>,
     filter: Filter,
     options: OnlineOptions,
+    on_ports_started: Option<Box<dyn FnOnce()>>,
 }
 
 impl<S> OnlineRuntime<S>
@@ -113,11 +114,22 @@ where
             monitor,
             filter: hw_filter,
             options,
+            on_ports_started: None,
         }
+    }
+
+    pub(crate) fn set_on_ports_started(&mut self, hook: Box<dyn FnOnce()>) {
+        self.on_ports_started = Some(hook);
     }
 
     pub(crate) fn run(&mut self) {
         self.start_ports();
+
+        // After the ports' base rules are in (so rules the hook installs are reachable) and before
+        // any RX core runs (so the hook's work is done before the first packet is processed).
+        if let Some(hook) = self.on_ports_started.take() {
+            hook();
+        }
 
         // Declared before the cores launch, so `wall` can be turned into a per-core duty cycle
         // during the run. Sink queues poll for the throughput sweep rather than doing datapath

@@ -156,6 +156,16 @@ where
         })
     }
 
+    /// Registers `hook` to run once, on the main thread, after the ports have started and their
+    /// base flow rules are installed but before any RX core is launched. Online only; ignored
+    /// offline, where there are no ports.
+    pub fn on_ports_started<F: FnOnce() + 'static>(&mut self, hook: F) {
+        match &mut self.online {
+            Some(online) => online.set_on_ports_started(Box::new(hook)),
+            None => log::warn!("on_ports_started hook ignored: no online runtime"),
+        }
+    }
+
     /// Run Iris for the duration specified in the configuration or until `ctrl-c` to terminate.
     ///
     /// # Example
