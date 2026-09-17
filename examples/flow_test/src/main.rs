@@ -23,6 +23,7 @@ use iris_core::dpdk::{rte_flow, rte_flow_action_handle};
 
 use std::{
     collections::{HashSet, VecDeque},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::{Arc, Mutex, OnceLock, RwLock},
@@ -90,6 +91,7 @@ static DISPATCHED: [AtomicUsize; 4] = [
     AtomicUsize::new(0),
     AtomicUsize::new(0),
 ];
+static PREFILLED: AtomicUsize = AtomicUsize::new(0);
 static INSTALLED_BY_KIND: [AtomicUsize; 4] = [
     AtomicUsize::new(0),
     AtomicUsize::new(0),
@@ -231,6 +233,12 @@ struct Args {
 
     #[clap(long, value_name = "COUNT", default_value = "20")]
     offload_after_pkts: usize,
+
+    /// Skip filling the rule table with --num-flows dummy rules before traffic is processed. By
+    /// default the table is prefilled, so real offloads run against a full table (each evicting a
+    /// dummy) from the first one.
+    #[clap(long = "no-prefill", action = ArgAction::SetFalse)]
+    prefill: bool,
 }
 
 const MODEL_FEATURE_PKTS: usize = 20;
@@ -245,6 +253,88 @@ fn uninstall_entry(entry: &FlowEntry) {
     if let Err(e) = uninstall_flow(entry.ports.clone(), raw_ptrs, raw_handles) {
         eprintln!("Failed to uninstall flow: {:?}", e);
     }
+}
+
+/// Install one flow's rules for `mode` on every port. `None` in Standard mode.
+fn install_entry(
+    mode: FlowMode,
+    ports: &[PortId],
+    tuple: &FiveTuple,
+    split_queues: Option<&[u16]>,
+) -> Option<Result<FlowEntry, String>> {
+    let result = match mode {
+        FlowMode::Drop => install_drop_flow(ports.to_vec(), tuple),
+        FlowMode::Split | FlowMode::TrimNativeDpdk => {
+            install_split_flow(ports.to_vec(), tuple, split_queues?)
+        }
+        FlowMode::Standard => return None,
+    };
+    Some(
+        result
+            .map(|(raw_flows, raw_handles)| FlowEntry {
+                tuple: *tuple,
+                ports: ports.to_vec(),
+                flow_ptrs: raw_flows.into_iter().map(FlowPtr).collect(),
+                handle_ptrs: raw_handles.into_iter().map(HandlePtr).collect(),
+            })
+            .map_err(|e| format!("{e:?}")),
+    )
+}
+
+/// The `i`th pre-fill tuple: TCP from 198.18.0.0/16 to 198.19.0.1:9. Both ranges are the RFC 2544
+/// benchmarking block, so no real connection matches a dummy rule; the high bits of `i` go in the
+/// source port so indices past 2^16 stay distinct.
+fn dummy_tuple(i: usize) -> FiveTuple {
+    let orig_ip = Ipv4Addr::new(198, 18, (i >> 8) as u8, i as u8);
+    let orig_port = 1024 + (i >> 16) as u16;
+    FiveTuple {
+        orig: SocketAddr::new(IpAddr::V4(orig_ip), orig_port),
+        resp: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 19, 0, 1)), 9),
+        proto: TCP_PROTOCOL,
+    }
+}
+
+/// Install `num_flows` dummy rules into FLOW_QUEUE, oldest first, so FIFO eviction retires them
+/// before any real flow. Stops at the first failure: a table that cannot take more rules is as
+/// full as it gets.
+fn prefill(num_flows: usize, rx_core: CoreId) {
+    let mode = *MODE.read().unwrap();
+    let Some(ports) = PORT_IDS.read().unwrap().clone() else {
+        eprintln!("prefill skipped: no ports");
+        return;
+    };
+    // Dummies match no traffic, so any core's queues will do.
+    let split_queues = if mode.uses_split_queues() {
+        let map = SPLIT_QUEUES.read().unwrap();
+        let queues = map.as_ref().and_then(|m| m.queues_for(rx_core));
+        if queues.is_none() {
+            eprintln!("prefill skipped: no split queue mapped for core {rx_core:?}");
+            return;
+        }
+        queues
+    } else {
+        None
+    };
+
+    let start = std::time::Instant::now();
+    let mut queue = FLOW_QUEUE.lock().unwrap();
+    for i in 0..num_flows {
+        match install_entry(mode, &ports, &dummy_tuple(i), split_queues.as_deref()) {
+            Some(Ok(entry)) => queue.push_back(entry),
+            Some(Err(e)) => {
+                eprintln!("prefill stopped after {i} rules: {e}");
+                break;
+            }
+            None => return,
+        }
+    }
+    PREFILLED.store(queue.len(), Ordering::Relaxed);
+    println!(
+        "prefilled {} of {} dummy flows in {:?}",
+        queue.len(),
+        num_flows,
+        start.elapsed()
+    );
 }
 
 // ===== TCP/UDP byte counting =====
@@ -609,29 +699,14 @@ fn main() {
                             TARGET_FLOWS.lock().unwrap().remove(&old.tuple);
                         }
 
-                        let result = match mode {
-                            FlowMode::Drop => install_drop_flow(ports.clone(), &tuple),
-                            FlowMode::Split | FlowMode::TrimNativeDpdk => install_split_flow(
-                                ports.clone(),
-                                &tuple,
-                                split_queues.as_ref().unwrap(),
-                            ),
-                            FlowMode::Standard => return,
-                        };
-
-                        match result {
-                            Ok((raw_flows, raw_handles)) => {
-                                let entry = FlowEntry {
-                                    tuple: tuple.clone(),
-                                    ports: ports.clone(),
-                                    flow_ptrs: raw_flows.into_iter().map(FlowPtr).collect(),
-                                    handle_ptrs: raw_handles.into_iter().map(HandlePtr).collect(),
-                                };
-                                TARGET_FLOWS.lock().unwrap().insert(tuple.clone());
+                        match install_entry(mode, &ports, &tuple, split_queues.as_deref()) {
+                            Some(Ok(entry)) => {
+                                TARGET_FLOWS.lock().unwrap().insert(tuple);
                                 FLOW_QUEUE.lock().unwrap().push_back(entry);
                                 INSTALLED_BY_KIND[kind.idx()].fetch_add(1, Ordering::Relaxed);
                             }
-                            Err(e) => eprintln!("install flow failed: {e:?}"),
+                            Some(Err(e)) => eprintln!("install flow failed: {e}"),
+                            None => return,
                         }
                     } else {
                         eprintln!("PORT_IDS is None when trying to install flow!");
@@ -660,6 +735,14 @@ fn main() {
         }
 
         *PORT_IDS.write().unwrap() = Some(port_ids);
+    }
+
+    // Nothing to fill in Standard mode (no rules are installed), with --num-flows 0, or offline.
+    if args.prefill && flow_mode != FlowMode::Standard && args.num_flows > 0 {
+        if let Some(&rx_core) = config.get_all_rx_core_ids().first() {
+            let num_flows = args.num_flows;
+            runtime.on_ports_started(move || prefill(num_flows, rx_core));
+        }
     }
 
     // Run packet processing
@@ -709,6 +792,13 @@ fn main() {
     let discarded_packets = DISCARDED_PACKETS.load(std::sync::atomic::Ordering::Relaxed);
     let discarded_bytes = DISCARDED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
     println!("{discarded_packets} packets and {discarded_bytes} bytes discarded");
+
+    if args.prefill {
+        println!(
+            "{} dummy flows prefilled",
+            PREFILLED.load(Ordering::Relaxed)
+        );
+    }
 
     println!("=== Offload by protocol ===");
     println!(
