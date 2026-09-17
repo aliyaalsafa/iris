@@ -584,6 +584,9 @@ pub fn install_split_flow(
 /// counters first. `flows` and `handles` are parallel vectors of equal length.
 /// The queried hits/bytes are accumulated into the global DISCARDED_PACKETS /
 /// DISCARDED_BYTES counters rather than printed per rule.
+///
+/// A rule that fails to destroy does not stop the rest: every rule is
+/// attempted, and the failures are reported together in the returned error.
 pub fn uninstall_flow(
     port_ids: Vec<PortId>,
     flows: Vec<*mut rte_flow>,
@@ -607,6 +610,7 @@ pub fn uninstall_flow(
 
     // forward flows occupy [0..ports.len()), reverse flows [ports.len()..2*ports.len())
     let n = port_ids.len();
+    let mut failures = Vec::new();
     for (idx, flow) in flows.iter().enumerate() {
         let port_id = &port_ids[idx % n];
         let handle = handles[idx];
@@ -638,11 +642,11 @@ pub fn uninstall_flow(
 
         if ret != 0 {
             let msg = unsafe { CStr::from_ptr(error.message).to_string_lossy().into_owned() };
-            bail!(
-                "Failed to uninstall flow on port {}: {}",
-                port_id.raw(),
-                msg
-            );
+            // Keep going: the caller forgets this rule set whatever we return, so any rule
+            // skipped here would stay on the NIC with nothing left to destroy it. The handle is
+            // kept too, since the rule that failed to go still references it.
+            failures.push(format!("port {}: {}", port_id.raw(), msg));
+            continue;
         }
 
         // Destroy the indirect counter handle after the rule referencing it
@@ -661,6 +665,14 @@ pub fn uninstall_flow(
         }
     }
 
+    if !failures.is_empty() {
+        bail!(
+            "Failed to uninstall {} of {} rules ({})",
+            failures.len(),
+            flows.len(),
+            failures.join("; ")
+        );
+    }
     Ok(())
 }
 
