@@ -13,10 +13,10 @@ use iris_core::{
     port::PortId,
     protocols::packet::tcp::TCP_PROTOCOL,
     protocols::packet::udp::UDP_PROTOCOL,
-    subscription::Tracked,
+    subscription::{StreamingCallback, Tracked},
 };
 
-use iris_compiler::{callback, datatype, datatype_fn, input_files, iris_end_macros};
+use iris_compiler::{callback, callback_fn, datatype, datatype_fn, input_files, iris_end_macros};
 
 use std::{
     path::PathBuf,
@@ -48,13 +48,18 @@ fn offload_after_pkts() -> usize {
 }
 
 #[inline]
+fn pkts_since_match(baseline: &mut Option<usize>, pkts: &PktCount) -> usize {
+    pkts.total() - *baseline.get_or_insert(pkts.total())
+}
+
+#[inline]
 fn offload_enabled(protocol: Protocol) -> bool {
     STATS[protocol].enabled.load(Ordering::Relaxed)
 }
 
 #[inline]
-fn offer_for_offload(proto: Protocol, five_tuple: &FiveTuple, rx_core: &CoreId, total_pkts: usize) {
-    if total_pkts != offload_after_pkts() || !offload_enabled(proto) {
+fn offer_for_offload(proto: Protocol, five_tuple: &FiveTuple, rx_core: &CoreId, depth: usize) {
+    if depth != offload_after_pkts() || !offload_enabled(proto) {
         return;
     }
     if let Some(dispatcher) = FLOW_DISPATCHER.get() {
@@ -245,66 +250,135 @@ fn record_maybe_quic_bytes(bytes: &EncryptedWireBytes) {
 
 // Fire on TLS connections
 #[callback("tls,level=InL4Conn")]
-#[allow(unused_variables)]
-fn tls_cb(
-    five_tuple: &FiveTuple,
-    rx_core: &CoreId,
-    pkts: &PktCount,
-    conn: &ConnRecord,
-    iat: &InterArrivals,
-    tls: &TlsHandshake,
-) -> bool {
-    if pkts.total() != offload_after_pkts() {
-        return true;
+#[derive(Debug)]
+struct TlsOffload {
+    baseline: Option<usize>,
+}
+
+impl StreamingCallback for TlsOffload {
+    fn new(_first_pkt: &L4Pdu) -> Self {
+        Self { baseline: None }
     }
 
-    let is_elephant = if *USE_MODEL.get().unwrap_or(&false) {
-        let conn_hash = conn.five_tuple.conn_hash();
-        let first_seen_ts = conn
-            .first_seen_wall
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as u64;
-        let inv = ConnInvariants::from_conn(conn, conn_hash, first_seen_ts);
+    fn clear(&mut self) {}
+}
 
-        match (
-            ConnFeatures::from_conn_at(conn, iat, MODEL_FEATURE_PKTS as u64, &inv),
-            TlsFeatures::from_tls(tls),
-        ) {
-            (Some(conn_features), Some(tls_features)) => {
-                model::predict(&conn_features, &tls_features)
-                    .map(|proba| proba >= 0.5)
-                    .unwrap_or(false)
-            }
-            _ => false,
+impl TlsOffload {
+    #[callback_fn("TlsOffload,level=InL4Conn")]
+    #[allow(unused_variables)]
+    fn on_packet(
+        &mut self,
+        five_tuple: &FiveTuple,
+        rx_core: &CoreId,
+        pkts: &PktCount,
+        conn: &ConnRecord,
+        iat: &InterArrivals,
+        tls: &TlsHandshake,
+    ) -> bool {
+        let depth = pkts_since_match(&mut self.baseline, pkts);
+        if depth != offload_after_pkts() {
+            return true;
         }
-    } else {
+
+        let is_elephant = if *USE_MODEL.get().unwrap_or(&false) {
+            let conn_hash = conn.five_tuple.conn_hash();
+            let first_seen_ts = conn
+                .first_seen_wall
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros() as u64;
+            let inv = ConnInvariants::from_conn(conn, conn_hash, first_seen_ts);
+
+            match (
+                ConnFeatures::from_conn_at(conn, iat, MODEL_FEATURE_PKTS as u64, &inv),
+                TlsFeatures::from_tls(tls),
+            ) {
+                (Some(conn_features), Some(tls_features)) => {
+                    model::predict(&conn_features, &tls_features)
+                        .map(|proba| proba >= 0.5)
+                        .unwrap_or(false)
+                }
+                _ => false,
+            }
+        } else {
+            true
+        };
+
+        if is_elephant {
+            offer_for_offload(Protocol::Tls, five_tuple, rx_core, depth);
+        }
+
         true
-    };
-
-    if is_elephant {
-        offer_for_offload(Protocol::Tls, five_tuple, rx_core, pkts.total());
     }
-
-    true
 }
 
 #[callback("ssh,level=InL4Conn")]
-fn ssh_cb(five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount) -> bool {
-    offer_for_offload(Protocol::Ssh, five_tuple, rx_core, pkts.total());
-    true
+#[derive(Debug)]
+struct SshOffload {
+    baseline: Option<usize>,
+}
+
+impl StreamingCallback for SshOffload {
+    fn new(_first_pkt: &L4Pdu) -> Self {
+        Self { baseline: None }
+    }
+
+    fn clear(&mut self) {}
+}
+
+impl SshOffload {
+    #[callback_fn("SshOffload,level=InL4Conn")]
+    fn on_packet(&mut self, five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount) -> bool {
+        let depth = pkts_since_match(&mut self.baseline, pkts);
+        offer_for_offload(Protocol::Ssh, five_tuple, rx_core, depth);
+        true
+    }
 }
 
 #[callback("quic,level=InL4Conn")]
-fn quic_cb(five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount) -> bool {
-    offer_for_offload(Protocol::Quic, five_tuple, rx_core, pkts.total());
-    true
+#[derive(Debug)]
+struct QuicOffload {
+    baseline: Option<usize>,
+}
+
+impl StreamingCallback for QuicOffload {
+    fn new(_first_pkt: &L4Pdu) -> Self {
+        Self { baseline: None }
+    }
+
+    fn clear(&mut self) {}
+}
+
+impl QuicOffload {
+    #[callback_fn("QuicOffload,level=InL4Conn")]
+    fn on_packet(&mut self, five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount) -> bool {
+        let depth = pkts_since_match(&mut self.baseline, pkts);
+        offer_for_offload(Protocol::Quic, five_tuple, rx_core, depth);
+        true
+    }
 }
 
 #[callback("MaybeQuic,level=InL4Conn")]
-fn maybe_quic_cb(five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount) -> bool {
-    offer_for_offload(Protocol::MaybeQuic, five_tuple, rx_core, pkts.total());
-    true
+#[derive(Debug)]
+struct MaybeQuicOffload {
+    baseline: Option<usize>,
+}
+
+impl StreamingCallback for MaybeQuicOffload {
+    fn new(_first_pkt: &L4Pdu) -> Self {
+        Self { baseline: None }
+    }
+
+    fn clear(&mut self) {}
+}
+
+impl MaybeQuicOffload {
+    #[callback_fn("MaybeQuicOffload,level=InL4Conn")]
+    fn on_packet(&mut self, five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount) -> bool {
+        let depth = pkts_since_match(&mut self.baseline, pkts);
+        offer_for_offload(Protocol::MaybeQuic, five_tuple, rx_core, depth);
+        true
+    }
 }
 
 #[input_files("$IRIS_HOME/datatypes/data.txt")]
@@ -332,18 +406,6 @@ fn main() {
             .join(", "),
         args.offload_after_pkts,
     );
-
-    if offload_enabled(Protocol::MaybeQuic)
-        && args.offload_after_pkts <= iris_datatypes::MAYBE_QUIC_WINDOW
-    {
-        eprintln!(
-            "warning: --offload-after-pkts {} does not exceed the MaybeQuic evidence window ({} \
-             payload-bearing packets); connections carrying any non-payload packets will accept \
-             too late to be offered, so the maybe_quic arm will under-report.",
-            args.offload_after_pkts,
-            iris_datatypes::MAYBE_QUIC_WINDOW,
-        );
-    }
 
     let use_model = match &args.model {
         Some(path) => {

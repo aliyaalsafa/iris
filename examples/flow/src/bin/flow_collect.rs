@@ -72,6 +72,7 @@ fn packet_wall_ts_us(conn: &ConnRecord) -> u64 {
 struct PrefixSweep {
     snapshots: Vec<Snapshot>,
     next_depth_i: usize,
+    baseline: Option<u64>,
     tls: Option<Arc<TlsFeatures>>,
     inv: Option<ConnInvariants>,
     trace_batch: Vec<TraceRecord>,
@@ -83,6 +84,7 @@ impl StreamingCallback for PrefixSweep {
         PrefixSweep {
             snapshots: Vec::with_capacity(depths().len()),
             next_depth_i: 0,
+            baseline: None,
             tls: None,
             inv: None,
             trace_batch: Vec::with_capacity(if trace_enabled() { TRACE_BATCH_N } else { 0 }),
@@ -120,10 +122,11 @@ impl PrefixSweep {
 
     fn record_snapshots(&mut self, conn: &ConnRecord, iat: &InterArrivals, tls: &TlsHandshake) {
         let total = conn.total_pkts();
+        let pkts = total - *self.baseline.get_or_insert(total);
         let Some(&next_depth) = depths().get(self.next_depth_i) else {
             return;
         };
-        if total < next_depth {
+        if pkts < next_depth {
             return;
         }
         if self.tls.is_none() {
@@ -136,7 +139,7 @@ impl PrefixSweep {
         let inv = self
             .inv
             .get_or_insert_with(|| ConnInvariants::from_conn(conn, conn_hash, first_seen_ts));
-        while let Some(&depth) = depths().get(self.next_depth_i).filter(|&&d| d <= total) {
+        while let Some(&depth) = depths().get(self.next_depth_i).filter(|&&d| d <= pkts) {
             if let Some(cf) = ConnFeatures::from_conn_at(conn, iat, depth, inv) {
                 self.snapshots.push(Snapshot {
                     conn: cf,
