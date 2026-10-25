@@ -1,9 +1,9 @@
-// examples/flow_test/src/model.rs
+// examples/flow/src/model.rs
 use lightgbm3::Booster;
 use std::sync::OnceLock;
 
-use flow_features::conn_features::ConnFeatures;
-use flow_features::tls_features::TlsFeatures;
+use crate::features::conn_features::ConnFeatures;
+use crate::features::tls_features::TlsFeatures;
 
 pub struct SendSyncBooster(Booster);
 unsafe impl Send for SendSyncBooster {}

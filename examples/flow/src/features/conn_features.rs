@@ -45,7 +45,7 @@ impl ConnInvariants {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct ConnFeatures {
     pub conn_hash: u64, // full-tuple u64 hash; pair with first_seen_ts for the connection key
 
@@ -121,7 +121,6 @@ impl ConnFeatures {
         let (orig_iat_mean, orig_iat_min, orig_iat_max, orig_iat_std) = iat.stats_ctos.summary();
         let (resp_iat_mean, resp_iat_min, resp_iat_max, resp_iat_std) = iat.stats_stoc.summary();
 
-        // Read LIVE connection state directly (pre-snapshot connection.rs has no prefix_* fields).
         let orig = &conn.orig;
         let resp = &conn.resp;
 

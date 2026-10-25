@@ -1,4 +1,4 @@
-use crate::hash_utils::hash_ip;
+use crate::features::hash_utils::hash_ip;
 use iris_core::protocols::stream::dns::Data;
 use iris_datatypes::DnsTransaction;
 use serde::Serialize;
@@ -50,7 +50,6 @@ impl DnsFeatures {
 
         let client_ip_hash = hash_ip(client_ip);
 
-        // Extract first A and AAAA answer for join key
         let mut resolved_ip_hash_a = 0u64;
         let mut resolved_ip_hash_aaaa = 0u64;
         if let Some(resp) = &dns.response {

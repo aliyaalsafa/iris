@@ -1,10 +1,9 @@
-use crate::hash_utils::hash_str;
+use crate::features::hash_utils::hash_str;
 use iris_datatypes::TlsHandshake;
 use serde::Serialize;
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct TlsFeatures {
-    // --- ClientHello ---
     pub has_client_hello: u8,             // 1 if a ClientHello was observed
     pub client_version: u16,              // legacy record version from ClientHello
     pub client_num_supported_groups: u16, // number of named groups in supported_groups extension
@@ -22,7 +21,6 @@ pub struct TlsFeatures {
     pub client_has_key_share: u8,         // 1 if key_share extension is present (TLS 1.3)
     pub client_has_supported_vers: u8,    // 1 if supported_versions extension is present (TLS 1.3)
 
-    // --- ServerHello ---
     pub has_server_hello: u8,         // 1 if a ServerHello was observed
     pub server_version: u16,          // legacy record version from ServerHello
     pub server_cipher_suite: u16,     // chosen cipher suite ID
@@ -31,13 +29,11 @@ pub struct TlsFeatures {
     pub server_has_key_share: u8,     // 1 if server sent key_share extension (TLS 1.3)
     pub server_has_selected_vers: u8, // 1 if server sent supported_versions extension (TLS 1.3)
 
-    // --- Certificates ---
     pub num_server_certs: u16, // number of certificates in the server certificate chain
     pub num_client_certs: u16, // number of certificates in the client certificate chain
     pub server_cert0_len: u32, // raw byte length of the leaf server certificate, 0 if absent
     pub server_cert1_len: u32, // raw byte length of the first intermediate cert, 0 if absent
 
-    // --- Key exchange ---
     pub has_server_kex: u8, // 1 if ServerKeyExchange was observed (TLS 1.2-)
     pub has_client_kex: u8, // 1 if ClientKeyExchange was observed (TLS 1.2-)
     pub kex_type: u8,       // 0=none/unknown 1=ECDH 2=DH 3=RSA
@@ -49,7 +45,6 @@ impl TlsFeatures {
             return None;
         }
 
-        // --- ClientHello fields ---
         let (
             has_client_hello,
             client_version,
@@ -93,7 +88,6 @@ impl TlsFeatures {
             (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
         };
 
-        // --- ServerHello fields ---
         let (
             has_server_hello,
             server_version,
@@ -116,7 +110,6 @@ impl TlsFeatures {
             (0, 0, 0, 0, 0, 0, 0)
         };
 
-        // --- Certificate fields ---
         let num_server_certs = tls.server_certificates.len() as u16;
         let num_client_certs = tls.client_certificates.len() as u16;
         let server_cert0_len = tls
@@ -130,7 +123,6 @@ impl TlsFeatures {
             .map(|c| c.raw.len() as u32)
             .unwrap_or(0);
 
-        // --- Key exchange fields ---
         use iris_core::protocols::stream::tls::{ClientKeyExchange, ServerKeyExchange};
         let has_server_kex = tls.server_key_exchange.is_some() as u8;
         let has_client_kex = tls.client_key_exchange.is_some() as u8;

@@ -29,10 +29,10 @@ use std::{
     sync::{Arc, Mutex, OnceLock, RwLock},
 };
 
-mod model;
+use flow::model;
 
-use flow_features::conn_features::{ConnFeatures, ConnInvariants};
-use flow_features::tls_features::TlsFeatures;
+use flow::features::conn_features::{ConnFeatures, ConnInvariants};
+use flow::features::tls_features::TlsFeatures;
 
 #[derive(Clone, Copy)]
 struct FlowPtr(*mut rte_flow);
@@ -234,9 +234,7 @@ struct Args {
     #[clap(long, value_name = "COUNT", default_value = "20")]
     offload_after_pkts: usize,
 
-    /// Skip filling the rule table with --num-flows dummy rules before traffic is processed. By
-    /// default the table is prefilled, so real offloads run against a full table (each evicting a
-    /// dummy) from the first one.
+    /// Skip filling the rule table with --num-flows dummy rules before traffic is processed.
     #[clap(long = "no-prefill", action = ArgAction::SetFalse)]
     prefill: bool,
 }
@@ -281,9 +279,6 @@ fn install_entry(
     )
 }
 
-/// The `i`th pre-fill tuple: TCP from 198.18.0.0/16 to 198.19.0.1:9. Both ranges are the RFC 2544
-/// benchmarking block, so no real connection matches a dummy rule; the high bits of `i` go in the
-/// source port so indices past 2^16 stay distinct.
 fn dummy_tuple(i: usize) -> FiveTuple {
     let orig_ip = Ipv4Addr::new(198, 18, (i >> 8) as u8, i as u8);
     let orig_port = 1024 + (i >> 16) as u16;
@@ -294,9 +289,6 @@ fn dummy_tuple(i: usize) -> FiveTuple {
     }
 }
 
-/// Install `num_flows` dummy rules into FLOW_QUEUE, oldest first, so FIFO eviction retires them
-/// before any real flow. Stops at the first failure: a table that cannot take more rules is as
-/// full as it gets.
 fn prefill(num_flows: usize, rx_core: CoreId) {
     let mode = *MODE.read().unwrap();
     let Some(ports) = PORT_IDS.read().unwrap().clone() else {
@@ -339,13 +331,6 @@ fn prefill(num_flows: usize, rx_core: CoreId) {
 
 // ===== TCP/UDP byte counting =====
 
-/// Per-connection on-wire byte count, split by transport protocol. Accumulated into the
-/// global `TCP_BYTES`/`UDP_BYTES` totals at `L4Terminated`. This runs independently of the
-/// TLS flow-handling path above; it counts every TCP/UDP frame's full `mbuf.data_len()`,
-/// headers included, regardless of whether the connection was ever admitted or installed.
-///
-/// Each frame is also fed to the per-core transport meter in iris_core so the monitor can
-/// print live per-second TCP/UDP throughput; that path is lock-free (thread-local).
 #[datatype]
 struct TransportBytes {
     tcp_bytes: usize,
@@ -390,10 +375,6 @@ fn record_transport_bytes(bytes: &TransportBytes) {
     UDP_BYTES.fetch_add(bytes.udp_bytes, Ordering::Relaxed);
 }
 
-/// Per-connection on-wire byte count, headers included. The datatype itself is
-/// protocol-blind -- it counts every frame of whatever connection it is attached
-/// to; the `L4Terminated` callbacks below decide which encrypted protocol each
-/// terminated connection's total is credited to.
 #[datatype]
 struct EncryptedWireBytes {
     bytes: usize,
@@ -416,9 +397,6 @@ impl Tracked for EncryptedWireBytes {
     }
 }
 
-/// Only Standard mode sees whole connections in software; in the other modes the
-/// offloaded remainder never reaches the datapath, so a byte total there would be
-/// counting only what was not offloaded.
 #[inline]
 fn record_encrypted_bytes(kind: FlowKind, bytes: &EncryptedWireBytes) {
     if *MODE.read().unwrap() == FlowMode::Standard {
@@ -515,9 +493,6 @@ fn maybe_quic_cb(five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount) -> b
 #[input_files("$IRIS_HOME/datatypes/data.txt")]
 #[iris_end_macros]
 fn main() {
-    // Without this every log::error! in iris-core is discarded, including the PCIe monitor's
-    // "disabled" and "needs root" diagnostics — which is the only way to find out why a monitor
-    // produced no samples. Controlled by RUST_LOG, so it stays silent unless asked.
     env_logger::init();
 
     // Parse CLI args
@@ -557,9 +532,6 @@ fn main() {
 
     let use_model = match &args.model {
         Some(path) => {
-            // The model's features are snapshotted at a fixed packet count, so moving the
-            // threshold would feed it features from the wrong point in the connection. That is a
-            // silent correctness bug, not a tuning choice.
             assert_eq!(
                 args.offload_after_pkts, MODEL_FEATURE_PKTS,
                 "--model requires --offload-after-pkts {MODEL_FEATURE_PKTS} (the packet count the \
@@ -606,12 +578,7 @@ fn main() {
         config.online.is_some()
     );
 
-    // Initialize split queues if needed. Both trim paths use the same queue
-    // layout; they differ only in whether the NIC DMAs the payload segment.
     if flow_mode.uses_split_queues() {
-        // Queue ids are per port, so the map yields one id per port for a
-        // given core: a rule goes onto every port, and a queue id taken from
-        // one port means nothing on another.
         if let Some(online) = &config.online {
             *SPLIT_QUEUES.write().unwrap() = Some(SplitQueueMap::from_config(online));
         }
@@ -751,12 +718,8 @@ fn main() {
     // Graceful shutdown
     let final_stats = worker_handle.shutdown(args.flush_channels.as_ref());
 
-    // Offline there is no monitor, so this is the only report of where the RX cores' cycles
-    // went; online the same figures go to cycle_budget.csv every interval.
     println!("{}", iris_core::lcore::datapath_budget::current());
 
-    // Read after shutdown so the last batch is included; the monitor's own line, printed
-    // earlier, shows the same pools live.
     for p in iris_core::multicore::worker_budget::pools() {
         let w = p.budget;
         let tsc_hz = unsafe { iris_core::rte_get_tsc_hz() };
@@ -772,11 +735,6 @@ fn main() {
         );
     }
 
-    // Discard totals are accumulated at eviction time (each evicted rule's
-    // indirect counter is queried in uninstall_flow). Flows still resident at
-    // exit were never evicted, so their counters have not been read yet. Query
-    // them here (WITHOUT destroying the rules — mass rte_flow_destroy at
-    // shutdown faults in the PMD) so the totals include the resident set too.
     {
         let queue = FLOW_QUEUE.lock().unwrap();
         for entry in queue.iter() {
@@ -816,8 +774,6 @@ fn main() {
     }
 
     if *MODE.read().unwrap() == FlowMode::Standard {
-        // MaybeQuic vetoes itself once a parser claims the connection, so the
-        // kinds are disjoint and the total is a true sum.
         println!("=== On-wire bytes by encrypted protocol (Standard mode) ===");
         println!("{:<12}{:>16}", "kind", "bytes");
         let mut total = 0;

@@ -17,7 +17,7 @@
 //!             capped at `--num-flows`, expired after `--hw-rule-secs`. Tail
 //!             packets are then dropped in the NIC and never reach the CPU.
 //!             Needs `dyn_hardware_assist = true` in the config so the mlx5 flow
-//!             engine is configured. This mirrors examples/flow_test.
+//!             engine is configured. This mirrors examples/flow/src/bin/flow_test.rs.
 //!   filter    in-pipeline drop before the callback: after the head, the
 //!             callback returns `false` to unsubscribe the connection, so the
 //!             pipeline stops delivering its tail to the callback (verified:
