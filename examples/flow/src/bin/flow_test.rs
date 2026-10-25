@@ -1,16 +1,14 @@
-use clap::{ArgAction, Parser, ValueEnum};
+use clap::{ArgAction, Parser};
+use enum_map::{Enum, EnumMap};
 use iris_datatypes::conn_fts::InterArrivals;
 use iris_datatypes::{ConnRecord, PktCount, TlsHandshake};
-use lazy_static::lazy_static;
 use serde::Serialize;
+use strum::IntoStaticStr;
 
 use iris_core::{
     CoreId, FiveTuple, L4Pdu, Runtime,
     config::{FlowMode, default_config, load_config},
-    filter::flow_drop::{
-        DISCARDED_BYTES, DISCARDED_PACKETS, SplitQueueMap, install_drop_flow, install_split_flow,
-        query_resident_flow, uninstall_flow,
-    },
+    filter::flow_drop::{DISCARDED_BYTES, DISCARDED_PACKETS, SplitQueueMap},
     multicore::{ChannelDispatcher, ChannelMode, SharedWorkerThreadSpawner},
     port::PortId,
     protocols::packet::tcp::TCP_PROTOCOL,
@@ -19,90 +17,30 @@ use iris_core::{
 };
 
 use iris_compiler::{callback, datatype, datatype_fn, input_files, iris_end_macros};
-use iris_core::dpdk::{rte_flow, rte_flow_action_handle};
 
 use std::{
-    collections::{HashSet, VecDeque},
-    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::{Arc, Mutex, OnceLock, RwLock},
 };
 
+use flow::flow_table::{FlowTable, InstallError};
 use flow::model;
 
 use flow::features::conn_features::{ConnFeatures, ConnInvariants};
 use flow::features::tls_features::TlsFeatures;
 
-#[derive(Clone, Copy)]
-struct FlowPtr(*mut rte_flow);
-unsafe impl Send for FlowPtr {}
-unsafe impl Sync for FlowPtr {}
-
-#[derive(Clone, Copy)]
-struct HandlePtr(*mut rte_flow_action_handle);
-unsafe impl Send for HandlePtr {}
-unsafe impl Sync for HandlePtr {}
-
-#[derive(Clone)]
-struct FlowEntry {
-    tuple: FiveTuple,
-    ports: Vec<PortId>,
-    flow_ptrs: Vec<FlowPtr>,
-    handle_ptrs: Vec<HandlePtr>,
-}
-
-lazy_static! {
-    static ref PORT_IDS: RwLock<Option<Vec<PortId>>> = RwLock::new(None);
-    static ref TARGET_FLOWS: Mutex<HashSet<FiveTuple>> = Mutex::new(HashSet::new());
-    static ref FLOW_QUEUE: Mutex<VecDeque<FlowEntry>> = Mutex::new(VecDeque::new());
-}
-
 static TCP_BYTES: AtomicUsize = AtomicUsize::new(0);
 static UDP_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-/// On-wire bytes per encrypted protocol, indexed by `FlowKind::idx()`.
-static ENCRYPTED_BYTES: [AtomicUsize; 4] = [
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-];
 
 // Dispatching
 static FLOW_DISPATCHER: OnceLock<Arc<ChannelDispatcher<FlowEvent>>> = OnceLock::new();
 static MODE: RwLock<FlowMode> = RwLock::new(FlowMode::Standard);
-static SPLIT_QUEUES: RwLock<Option<SplitQueueMap>> = RwLock::new(None);
+static TABLE: OnceLock<Mutex<FlowTable>> = OnceLock::new();
 
-static NUM_FLOWS: OnceLock<usize> = OnceLock::new();
 static USE_MODEL: OnceLock<bool> = OnceLock::new();
 
-static OFFLOAD_ENABLED: [AtomicBool; 4] = [
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-];
 static OFFLOAD_AFTER_PKTS: OnceLock<usize> = OnceLock::new();
-
-static DISPATCHED: [AtomicUsize; 4] = [
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-];
-static PREFILLED: AtomicUsize = AtomicUsize::new(0);
-static INSTALLED_BY_KIND: [AtomicUsize; 4] = [
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-];
-
-#[inline]
-fn offload_enabled(kind: FlowKind) -> bool {
-    OFFLOAD_ENABLED[kind.idx()].load(Ordering::Relaxed)
-}
 
 #[inline]
 fn offload_after_pkts() -> usize {
@@ -110,8 +48,13 @@ fn offload_after_pkts() -> usize {
 }
 
 #[inline]
-fn offer_for_offload(kind: FlowKind, five_tuple: &FiveTuple, rx_core: &CoreId, total_pkts: usize) {
-    if total_pkts != offload_after_pkts() || !offload_enabled(kind) {
+fn offload_enabled(protocol: Protocol) -> bool {
+    STATS[protocol].enabled.load(Ordering::Relaxed)
+}
+
+#[inline]
+fn offer_for_offload(proto: Protocol, five_tuple: &FiveTuple, rx_core: &CoreId, total_pkts: usize) {
+    if total_pkts != offload_after_pkts() || !offload_enabled(proto) {
         return;
     }
     if let Some(dispatcher) = FLOW_DISPATCHER.get() {
@@ -119,45 +62,44 @@ fn offer_for_offload(kind: FlowKind, five_tuple: &FiveTuple, rx_core: &CoreId, t
             FlowEvent::FlowSeen {
                 tuple: *five_tuple,
                 rx_core: *rx_core,
-                kind,
+                proto,
             },
             Some(rx_core),
         );
-        DISPATCHED[kind.idx()].fetch_add(1, Ordering::Relaxed);
+        STATS[proto].dispatched.fetch_add(1, Ordering::Relaxed);
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, ValueEnum)]
-enum FlowKind {
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Enum, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+enum Protocol {
     Tls,
     Ssh,
     Quic,
     MaybeQuic,
 }
 
-impl FlowKind {
-    fn label(self) -> &'static str {
-        match self {
-            FlowKind::Tls => "tls",
-            FlowKind::Ssh => "ssh",
-            FlowKind::Quic => "quic",
-            FlowKind::MaybeQuic => "maybe_quic",
+struct ProtocolStats {
+    enabled: AtomicBool,
+    dispatched: AtomicUsize,
+    installed: AtomicUsize,
+    wire_bytes: AtomicUsize,
+}
+
+impl ProtocolStats {
+    const fn new() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            dispatched: AtomicUsize::new(0),
+            installed: AtomicUsize::new(0),
+            wire_bytes: AtomicUsize::new(0),
         }
     }
-
-    fn all() -> [FlowKind; 4] {
-        [
-            FlowKind::Tls,
-            FlowKind::Ssh,
-            FlowKind::Quic,
-            FlowKind::MaybeQuic,
-        ]
-    }
-
-    const fn idx(self) -> usize {
-        self as usize
-    }
 }
+
+/// Per-protocol switch and counters, indexed by `Protocol`: `STATS[Protocol::Ssh].dispatched`.
+static STATS: EnumMap<Protocol, ProtocolStats> =
+    EnumMap::from_array([const { ProtocolStats::new() }; 4]);
 
 #[derive(Clone, Serialize)]
 enum FlowEvent {
@@ -165,17 +107,11 @@ enum FlowEvent {
     FlowSeen {
         tuple: FiveTuple,
         rx_core: CoreId,
-        kind: FlowKind,
+        proto: Protocol,
     },
 }
 
 // ===== CLI =====
-#[derive(Copy, Clone, Debug, ValueEnum)]
-enum ChannelModeArg {
-    PerCore,
-    Shared,
-}
-
 #[derive(Parser, Debug)]
 struct Args {
     #[clap(short, long, value_parser, value_name = "FILE")]
@@ -190,26 +126,6 @@ struct Args {
     )]
     outfile: PathBuf,
 
-    #[clap(long, value_name = "SIZE", default_value = "32768")]
-    flow_channel_size: usize,
-
-    #[clap(
-        long,
-        value_delimiter = ',',
-        value_name = "CORES",
-        default_value = "40"
-    )]
-    worker_cores: Vec<u32>,
-
-    #[clap(long, value_name = "SIZE", default_value = "16")]
-    batch_size: usize,
-
-    #[clap(long, value_enum, default_value = "per-core")]
-    channel_mode: ChannelModeArg,
-
-    #[clap(long, value_parser, value_name = "PATH")]
-    flush_channels: Option<PathBuf>,
-
     #[clap(long, action = ArgAction::SetTrue)]
     show_stats: bool,
 
@@ -222,112 +138,11 @@ struct Args {
     #[clap(long, value_name = "COUNT", default_value = "100")]
     num_flows: usize,
 
-    #[clap(
-        long,
-        value_enum,
-        value_delimiter = ',',
-        value_name = "KINDS",
-        default_value = "tls,ssh,quic,maybe-quic"
-    )]
-    offload_protos: Vec<FlowKind>,
-
     #[clap(long, value_name = "COUNT", default_value = "20")]
     offload_after_pkts: usize,
-
-    /// Skip filling the rule table with --num-flows dummy rules before traffic is processed.
-    #[clap(long = "no-prefill", action = ArgAction::SetFalse)]
-    prefill: bool,
 }
 
 const MODEL_FEATURE_PKTS: usize = 20;
-
-// ===== Helpers =====
-
-/// Uninstall a single flow entry's rules. Does not touch TARGET_FLOWS.
-fn uninstall_entry(entry: &FlowEntry) {
-    let raw_ptrs: Vec<*mut rte_flow> = entry.flow_ptrs.iter().map(|fp| fp.0).collect();
-    let raw_handles: Vec<*mut rte_flow_action_handle> =
-        entry.handle_ptrs.iter().map(|hp| hp.0).collect();
-    if let Err(e) = uninstall_flow(entry.ports.clone(), raw_ptrs, raw_handles) {
-        eprintln!("Failed to uninstall flow: {:?}", e);
-    }
-}
-
-/// Install one flow's rules for `mode` on every port. `None` in Standard mode.
-fn install_entry(
-    mode: FlowMode,
-    ports: &[PortId],
-    tuple: &FiveTuple,
-    split_queues: Option<&[u16]>,
-) -> Option<Result<FlowEntry, String>> {
-    let result = match mode {
-        FlowMode::Drop => install_drop_flow(ports.to_vec(), tuple),
-        FlowMode::Split | FlowMode::TrimNativeDpdk => {
-            install_split_flow(ports.to_vec(), tuple, split_queues?)
-        }
-        FlowMode::Standard => return None,
-    };
-    Some(
-        result
-            .map(|(raw_flows, raw_handles)| FlowEntry {
-                tuple: *tuple,
-                ports: ports.to_vec(),
-                flow_ptrs: raw_flows.into_iter().map(FlowPtr).collect(),
-                handle_ptrs: raw_handles.into_iter().map(HandlePtr).collect(),
-            })
-            .map_err(|e| format!("{e:?}")),
-    )
-}
-
-fn dummy_tuple(i: usize) -> FiveTuple {
-    let orig_ip = Ipv4Addr::new(198, 18, (i >> 8) as u8, i as u8);
-    let orig_port = 1024 + (i >> 16) as u16;
-    FiveTuple {
-        orig: SocketAddr::new(IpAddr::V4(orig_ip), orig_port),
-        resp: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 19, 0, 1)), 9),
-        proto: TCP_PROTOCOL,
-    }
-}
-
-fn prefill(num_flows: usize, rx_core: CoreId) {
-    let mode = *MODE.read().unwrap();
-    let Some(ports) = PORT_IDS.read().unwrap().clone() else {
-        eprintln!("prefill skipped: no ports");
-        return;
-    };
-    // Dummies match no traffic, so any core's queues will do.
-    let split_queues = if mode.uses_split_queues() {
-        let map = SPLIT_QUEUES.read().unwrap();
-        let queues = map.as_ref().and_then(|m| m.queues_for(rx_core));
-        if queues.is_none() {
-            eprintln!("prefill skipped: no split queue mapped for core {rx_core:?}");
-            return;
-        }
-        queues
-    } else {
-        None
-    };
-
-    let start = std::time::Instant::now();
-    let mut queue = FLOW_QUEUE.lock().unwrap();
-    for i in 0..num_flows {
-        match install_entry(mode, &ports, &dummy_tuple(i), split_queues.as_deref()) {
-            Some(Ok(entry)) => queue.push_back(entry),
-            Some(Err(e)) => {
-                eprintln!("prefill stopped after {i} rules: {e}");
-                break;
-            }
-            None => return,
-        }
-    }
-    PREFILLED.store(queue.len(), Ordering::Relaxed);
-    println!(
-        "prefilled {} of {} dummy flows in {:?}",
-        queue.len(),
-        num_flows,
-        start.elapsed()
-    );
-}
 
 // ===== TCP/UDP byte counting =====
 
@@ -398,30 +213,32 @@ impl Tracked for EncryptedWireBytes {
 }
 
 #[inline]
-fn record_encrypted_bytes(kind: FlowKind, bytes: &EncryptedWireBytes) {
+fn record_encrypted_bytes(proto: Protocol, bytes: &EncryptedWireBytes) {
     if *MODE.read().unwrap() == FlowMode::Standard {
-        ENCRYPTED_BYTES[kind.idx()].fetch_add(bytes.bytes, Ordering::Relaxed);
+        STATS[proto]
+            .wire_bytes
+            .fetch_add(bytes.bytes, Ordering::Relaxed);
     }
 }
 
 #[callback("tls,level=L4Terminated")]
 fn record_tls_bytes(bytes: &EncryptedWireBytes) {
-    record_encrypted_bytes(FlowKind::Tls, bytes);
+    record_encrypted_bytes(Protocol::Tls, bytes);
 }
 
 #[callback("ssh,level=L4Terminated")]
 fn record_ssh_bytes(bytes: &EncryptedWireBytes) {
-    record_encrypted_bytes(FlowKind::Ssh, bytes);
+    record_encrypted_bytes(Protocol::Ssh, bytes);
 }
 
 #[callback("quic,level=L4Terminated")]
 fn record_quic_bytes(bytes: &EncryptedWireBytes) {
-    record_encrypted_bytes(FlowKind::Quic, bytes);
+    record_encrypted_bytes(Protocol::Quic, bytes);
 }
 
 #[callback("MaybeQuic,level=L4Terminated")]
 fn record_maybe_quic_bytes(bytes: &EncryptedWireBytes) {
-    record_encrypted_bytes(FlowKind::MaybeQuic, bytes);
+    record_encrypted_bytes(Protocol::MaybeQuic, bytes);
 }
 
 // ===== Filters =====
@@ -466,7 +283,7 @@ fn tls_cb(
     };
 
     if is_elephant {
-        offer_for_offload(FlowKind::Tls, five_tuple, rx_core, pkts.total());
+        offer_for_offload(Protocol::Tls, five_tuple, rx_core, pkts.total());
     }
 
     true
@@ -474,19 +291,19 @@ fn tls_cb(
 
 #[callback("ssh,level=InL4Conn")]
 fn ssh_cb(five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount) -> bool {
-    offer_for_offload(FlowKind::Ssh, five_tuple, rx_core, pkts.total());
+    offer_for_offload(Protocol::Ssh, five_tuple, rx_core, pkts.total());
     true
 }
 
 #[callback("quic,level=InL4Conn")]
 fn quic_cb(five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount) -> bool {
-    offer_for_offload(FlowKind::Quic, five_tuple, rx_core, pkts.total());
+    offer_for_offload(Protocol::Quic, five_tuple, rx_core, pkts.total());
     true
 }
 
 #[callback("MaybeQuic,level=InL4Conn")]
 fn maybe_quic_cb(five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount) -> bool {
-    offer_for_offload(FlowKind::MaybeQuic, five_tuple, rx_core, pkts.total());
+    offer_for_offload(Protocol::MaybeQuic, five_tuple, rx_core, pkts.total());
     true
 }
 
@@ -501,24 +318,22 @@ fn main() {
         println!("{args:#?}");
     }
 
-    NUM_FLOWS.set(args.num_flows).unwrap();
-
-    for kind in &args.offload_protos {
-        OFFLOAD_ENABLED[kind.idx()].store(true, Ordering::Relaxed);
+    for proto in [Protocol::Tls, Protocol::Ssh, Protocol::Quic, Protocol::MaybeQuic] {
+        STATS[proto].enabled.store(true, Ordering::Relaxed);
     }
     OFFLOAD_AFTER_PKTS.set(args.offload_after_pkts).unwrap();
     println!(
         "offloading: [{}] at {} packets",
-        FlowKind::all()
+        STATS
             .iter()
-            .filter(|k| offload_enabled(**k))
-            .map(|k| k.label())
+            .filter(|(_, s)| s.enabled.load(Ordering::Relaxed))
+            .map(|(p, _)| <&str>::from(p))
             .collect::<Vec<_>>()
             .join(", "),
         args.offload_after_pkts,
     );
 
-    if offload_enabled(FlowKind::MaybeQuic)
+    if offload_enabled(Protocol::MaybeQuic)
         && args.offload_after_pkts <= iris_datatypes::MAYBE_QUIC_WINDOW
     {
         eprintln!(
@@ -560,13 +375,6 @@ fn main() {
         default_config()
     };
 
-    // Build ChannelMode
-    let rx_cores = config.get_all_rx_core_ids();
-    let channel_mode = match args.channel_mode {
-        ChannelModeArg::PerCore => ChannelMode::PerCore(rx_cores),
-        ChannelModeArg::Shared => ChannelMode::Shared,
-    };
-
     let flow_mode = config
         .online
         .as_ref()
@@ -578,16 +386,18 @@ fn main() {
         config.online.is_some()
     );
 
-    if flow_mode.uses_split_queues()
+    let split_queues = if flow_mode.uses_split_queues()
         && let Some(online) = &config.online
     {
-        *SPLIT_QUEUES.write().unwrap() = Some(SplitQueueMap::from_config(online));
-    }
+        Some(SplitQueueMap::from_config(online))
+    } else {
+        None
+    };
 
     // Create and publish the dispatcher
     let flow_dispatcher = Arc::new(ChannelDispatcher::new(
-        channel_mode.clone(),
-        args.flow_channel_size,
+        ChannelMode::PerCore(config.get_all_rx_core_ids()),
+        32768,
         "flow_dispatcher".to_string(),
     ));
     FLOW_DISPATCHER
@@ -595,89 +405,32 @@ fn main() {
         .map_err(|_| "Failed to set FLOW dispatcher")
         .unwrap();
 
-    // Map provided worker cores
-    let worker_core_ids: Vec<CoreId> = args.worker_cores.iter().map(|&c| CoreId(c)).collect();
-
-    if worker_core_ids.len() > 1 {
-        eprintln!(
-            "warning: {} worker cores supplied, but the flow handler runs \
-             serially; extra cores provide no additional throughput.",
-            worker_core_ids.len()
-        );
-    }
-
     // Spawn workers and attach the handler
     let worker_handle = SharedWorkerThreadSpawner::new()
-        .set_cores(worker_core_ids)
-        .set_batch_size(args.batch_size)
+        .set_cores(vec![CoreId(40)])
+        .set_batch_size(16)
         .measure_utilization(true)
-        .add_dispatcher(flow_dispatcher.clone(), |event: FlowEvent| {
-            match event {
-                FlowEvent::FlowSeen {
-                    tuple,
-                    rx_core,
-                    kind,
-                } => {
-                    let mode = *MODE.read().unwrap();
-                    if mode == FlowMode::Standard {
-                        return;
+        .add_dispatcher(flow_dispatcher.clone(), |event: FlowEvent| match event {
+            FlowEvent::FlowSeen {
+                tuple,
+                rx_core,
+                proto,
+            } => {
+                let Some(table) = TABLE.get() else {
+                    if *MODE.read().unwrap() != FlowMode::Standard {
+                        eprintln!("flow table not initialized; dropping offload request");
                     }
-
-                    let num_flows = *NUM_FLOWS.get().unwrap();
-
-                    // num_flows == 0 means install nothing.
-                    if num_flows == 0 {
-                        return;
+                    return;
+                };
+                match table.lock().unwrap().install(tuple, rx_core) {
+                    Ok(()) => {
+                        STATS[proto].installed.fetch_add(1, Ordering::Relaxed);
                     }
-
-                    // Deduplicate
-                    if TARGET_FLOWS.lock().unwrap().contains(&tuple) {
-                        return;
+                    Err(InstallError::Disabled | InstallError::AlreadyInstalled) => {}
+                    Err(InstallError::NoSplitQueue(core)) => {
+                        eprintln!("No split queue mapped for core {core:?}");
                     }
-
-                    // One split queue id per port, in the same order as PORT_IDS.
-                    let split_queues = if mode.uses_split_queues() {
-                        let map = SPLIT_QUEUES.read().unwrap();
-                        match map.as_ref().and_then(|m| m.queues_for(rx_core)) {
-                            Some(q) => Some(q),
-                            None => {
-                                eprintln!("No split queue mapped for core {rx_core:?}");
-                                return;
-                            }
-                        }
-                    } else {
-                        None
-                    };
-
-                    // Install, if we have ports
-                    let maybe_ports = PORT_IDS.read().unwrap().clone();
-                    if let Some(ports) = maybe_ports {
-                        // FIFO eviction
-                        let evicted = {
-                            let mut queue = FLOW_QUEUE.lock().unwrap();
-                            if queue.len() >= num_flows {
-                                queue.pop_front()
-                            } else {
-                                None
-                            }
-                        };
-                        if let Some(old) = evicted {
-                            uninstall_entry(&old);
-                            TARGET_FLOWS.lock().unwrap().remove(&old.tuple);
-                        }
-
-                        match install_entry(mode, &ports, &tuple, split_queues.as_deref()) {
-                            Some(Ok(entry)) => {
-                                TARGET_FLOWS.lock().unwrap().insert(tuple);
-                                FLOW_QUEUE.lock().unwrap().push_back(entry);
-                                INSTALLED_BY_KIND[kind.idx()].fetch_add(1, Ordering::Relaxed);
-                            }
-                            Some(Err(e)) => eprintln!("install flow failed: {e}"),
-                            None => (),
-                        }
-                    } else {
-                        eprintln!("PORT_IDS is None when trying to install flow!");
-                    }
+                    Err(e) => eprintln!("install flow failed: {e}"),
                 }
             }
         })
@@ -701,24 +454,32 @@ fn main() {
             println!("Port ID: {:?}", pid);
         }
 
-        *PORT_IDS.write().unwrap() = Some(port_ids);
-    }
-
-    // Nothing to fill in Standard mode (no rules are installed), with --num-flows 0, or offline.
-    if args.prefill
-        && flow_mode != FlowMode::Standard
-        && args.num_flows > 0
-        && let Some(&rx_core) = config.get_all_rx_core_ids().first()
-    {
-        let num_flows = args.num_flows;
-        runtime.on_ports_started(move || prefill(num_flows, rx_core));
+        if let Some(&rx_core) = config.get_all_rx_core_ids().first() {
+            let num_flows = args.num_flows;
+            runtime.on_ports_started(move || {
+                match FlowTable::new(flow_mode, port_ids, split_queues, num_flows, rx_core) {
+                    Ok(table) => {
+                        TABLE
+                            .set(Mutex::new(table))
+                            .map_err(|_| "Failed to set flow table")
+                            .unwrap();
+                    }
+                    Err(InstallError::NoSplitQueue(core)) => {
+                        eprintln!(
+                            "flow table not created: no split queue mapped for core {core:?}"
+                        );
+                    }
+                    Err(e) => eprintln!("flow table not created: {e}"),
+                }
+            });
+        }
     }
 
     // Run packet processing
     runtime.run();
 
     // Graceful shutdown
-    let final_stats = worker_handle.shutdown(args.flush_channels.as_ref());
+    let final_stats = worker_handle.shutdown(None);
 
     println!("{}", iris_core::lcore::datapath_budget::current());
 
@@ -737,52 +498,39 @@ fn main() {
         );
     }
 
-    {
-        let queue = FLOW_QUEUE.lock().unwrap();
-        for entry in queue.iter() {
-            let raw_ptrs: Vec<*mut rte_flow> = entry.flow_ptrs.iter().map(|fp| fp.0).collect();
-            let raw_handles: Vec<*mut rte_flow_action_handle> =
-                entry.handle_ptrs.iter().map(|hp| hp.0).collect();
-            if let Err(e) = query_resident_flow(&entry.ports, &raw_ptrs, &raw_handles) {
-                eprintln!("resident flow query failed: {e:?}");
-            }
-        }
+    if let Some(table) = TABLE.get() {
+        table.lock().unwrap().query_resident();
+        // Not called: runtime.run() already ran rte_flow_flush in Port::stop, so these rules are gone.
+        // table.lock().unwrap().uninstall_all();
     }
 
     let discarded_packets = DISCARDED_PACKETS.load(std::sync::atomic::Ordering::Relaxed);
     let discarded_bytes = DISCARDED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
     println!("{discarded_packets} packets and {discarded_bytes} bytes discarded");
 
-    if args.prefill {
-        println!(
-            "{} dummy flows prefilled",
-            PREFILLED.load(Ordering::Relaxed)
-        );
-    }
-
     println!("=== Offload by protocol ===");
     println!(
         "{:<12}{:>12}{:>12}{:>10}",
-        "kind", "dispatched", "installed", "enabled"
+        "proto", "dispatched", "installed", "enabled"
     );
-    for kind in FlowKind::all() {
+    for (proto, stats) in &STATS {
         println!(
             "{:<12}{:>12}{:>12}{:>10}",
-            kind.label(),
-            DISPATCHED[kind.idx()].load(Ordering::Relaxed),
-            INSTALLED_BY_KIND[kind.idx()].load(Ordering::Relaxed),
-            offload_enabled(kind),
+            <&str>::from(proto),
+            stats.dispatched.load(Ordering::Relaxed),
+            stats.installed.load(Ordering::Relaxed),
+            offload_enabled(proto),
         );
     }
 
     if *MODE.read().unwrap() == FlowMode::Standard {
         println!("=== On-wire bytes by encrypted protocol (Standard mode) ===");
-        println!("{:<12}{:>16}", "kind", "bytes");
+        println!("{:<12}{:>16}", "proto", "bytes");
         let mut total = 0;
-        for kind in FlowKind::all() {
-            let bytes = ENCRYPTED_BYTES[kind.idx()].load(Ordering::Relaxed);
+        for (proto, stats) in &STATS {
+            let bytes = stats.wire_bytes.load(Ordering::Relaxed);
             total += bytes;
-            println!("{:<12}{:>16}", kind.label(), bytes);
+            println!("{:<12}{:>16}", <&str>::from(proto), bytes);
         }
         println!("{:<12}{:>16}", "total", total);
     }

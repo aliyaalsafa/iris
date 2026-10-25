@@ -22,6 +22,8 @@ parquet = { version = "57", optional = true }
 serde_arrow = { version = "0.15.1", features = ["arrow-57"], optional = true }
 
 lightgbm3 = { version = "1", optional = true }
+enum-map = "3.1.0"
+strum = { version = "0.28.0", features = ["derive"] }
 
 [features]
 collect = ["dep:arrow", "dep:parquet", "dep:serde_arrow"]
