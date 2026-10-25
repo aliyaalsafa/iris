@@ -225,7 +225,6 @@ pub struct InterArrivals {
     /// kept: a per-packet history grows for the life of the connection.
     pub stats_ctos: IatStats,
     /// Interarrival statistics server-to-client (resp.) flow
-
     pub stats_stoc: IatStats,
 }
 

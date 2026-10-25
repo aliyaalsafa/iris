@@ -375,7 +375,8 @@ struct EventDir(PathBuf);
 
 impl EventDir {
     fn stage() -> Option<Self> {
-        let dir = EventDir(std::env::temp_dir().join(format!("iris-pcm-iio-{}", std::process::id())));
+        let dir =
+            EventDir(std::env::temp_dir().join(format!("iris-pcm-iio-{}", std::process::id())));
         let staged = fs::create_dir_all(&dir.0).and_then(|_| {
             EVENT_FILES
                 .iter()
@@ -882,9 +883,15 @@ mod tests {
                 })
                 .collect();
             let first_total = hnames.iter().position(|(_, v)| *v == "Total").unwrap();
-            assert!(hnames[first_total..].iter().all(|(_, v)| *v == "Total"), "{}", name);
             assert!(
-                hnames[..first_total].iter().any(|(h, _)| *h == "IB write (txns)"),
+                hnames[first_total..].iter().all(|(_, v)| *v == "Total"),
+                "{}",
+                name
+            );
+            assert!(
+                hnames[..first_total]
+                    .iter()
+                    .any(|(h, _)| *h == "IB write (txns)"),
                 "{}",
                 name
             );

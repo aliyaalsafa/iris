@@ -578,10 +578,10 @@ fn main() {
         config.online.is_some()
     );
 
-    if flow_mode.uses_split_queues() {
-        if let Some(online) = &config.online {
-            *SPLIT_QUEUES.write().unwrap() = Some(SplitQueueMap::from_config(online));
-        }
+    if flow_mode.uses_split_queues()
+        && let Some(online) = &config.online
+    {
+        *SPLIT_QUEUES.write().unwrap() = Some(SplitQueueMap::from_config(online));
     }
 
     // Create and publish the dispatcher
@@ -673,7 +673,7 @@ fn main() {
                                 INSTALLED_BY_KIND[kind.idx()].fetch_add(1, Ordering::Relaxed);
                             }
                             Some(Err(e)) => eprintln!("install flow failed: {e}"),
-                            None => return,
+                            None => (),
                         }
                     } else {
                         eprintln!("PORT_IDS is None when trying to install flow!");
@@ -705,11 +705,13 @@ fn main() {
     }
 
     // Nothing to fill in Standard mode (no rules are installed), with --num-flows 0, or offline.
-    if args.prefill && flow_mode != FlowMode::Standard && args.num_flows > 0 {
-        if let Some(&rx_core) = config.get_all_rx_core_ids().first() {
-            let num_flows = args.num_flows;
-            runtime.on_ports_started(move || prefill(num_flows, rx_core));
-        }
+    if args.prefill
+        && flow_mode != FlowMode::Standard
+        && args.num_flows > 0
+        && let Some(&rx_core) = config.get_all_rx_core_ids().first()
+    {
+        let num_flows = args.num_flows;
+        runtime.on_ports_started(move || prefill(num_flows, rx_core));
     }
 
     // Run packet processing
@@ -785,10 +787,10 @@ fn main() {
         println!("{:<12}{:>16}", "total", total);
     }
 
-    if args.show_stats {
-        if let Some(flow_stats) = final_stats.get(0) {
-            println!("=== FLOW Stats ===");
-            println!("{flow_stats}");
-        }
+    if args.show_stats
+        && let Some(flow_stats) = final_stats.first()
+    {
+        println!("=== FLOW Stats ===");
+        println!("{flow_stats}");
     }
 }
