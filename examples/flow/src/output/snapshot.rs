@@ -15,6 +15,7 @@ use crate::features::{conn_features::ConnFeatures, tls_features::TlsFeatures};
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct FinalLabel {
     pub final_total_payload_bytes: u64,
+    pub final_total_packet_bytes: u64,
     pub final_duration_ms: u64,
     pub final_total_pkts: u64,
 }

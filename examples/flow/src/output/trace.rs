@@ -15,7 +15,8 @@ pub struct TraceRecord {
     pub conn_hash: u64,        // full-tuple hash (1st half of the composite key)
     pub first_seen_ts: u64,    // connection first-seen, us (2nd half of the key)
     pub snapshot_ts: u64,      // per-packet arrival, us since UNIX_EPOCH
-    pub cumulative_bytes: u64, // orig+resp payload bytes through this packet
+    pub cumulative_payload_bytes: u64, // orig+resp payload bytes through this packet
+    pub cumulative_packet_bytes: u64, // orig+resp packet bytes through this packet
 }
 
 /// No-op unless `init_writer` was called with `trace = true`.

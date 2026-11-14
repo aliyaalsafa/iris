@@ -112,7 +112,8 @@ impl PrefixSweep {
             conn_hash,
             first_seen_ts,
             snapshot_ts: packet_wall_ts_us(conn),
-            cumulative_bytes: conn.total_payload_bytes(),
+            cumulative_payload_bytes: conn.total_payload_bytes(),
+            cumulative_packet_bytes: conn.total_pkt_bytes(),
         });
         if self.trace_batch.len() >= TRACE_BATCH_N {
             let full = std::mem::replace(&mut self.trace_batch, Vec::with_capacity(TRACE_BATCH_N));
@@ -173,6 +174,7 @@ impl PrefixSweep {
         if !self.snapshots.is_empty() {
             let label = FinalLabel {
                 final_total_payload_bytes: conn.total_payload_bytes(),
+                final_total_packet_bytes: conn.total_pkt_bytes(),
                 final_duration_ms: conn.duration().as_millis() as u64,
                 final_total_pkts: conn.total_pkts(),
             };
