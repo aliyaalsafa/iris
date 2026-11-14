@@ -122,7 +122,7 @@ impl PrefixSweep {
 
     fn record_snapshots(&mut self, conn: &ConnRecord, iat: &InterArrivals, tls: &TlsHandshake) {
         let total = conn.total_pkts();
-        let pkts = total - *self.baseline.get_or_insert(total);
+        let pkts = total - *self.baseline.get_or_insert(total) + 1;
         let Some(&next_depth) = depths().get(self.next_depth_i) else {
             return;
         };

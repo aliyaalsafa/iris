@@ -49,7 +49,7 @@ fn offload_after_pkts() -> usize {
 
 #[inline]
 fn pkts_since_match(baseline: &mut Option<usize>, pkts: &PktCount) -> usize {
-    pkts.total() - *baseline.get_or_insert(pkts.total())
+    pkts.total() - *baseline.get_or_insert(pkts.total()) + 1
 }
 
 #[inline]
