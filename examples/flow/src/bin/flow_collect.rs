@@ -56,7 +56,7 @@ struct Args {
 
     /// Packet depths for stream-1 snapshots, e.g. `--depths 5,10,40`.
     /// Sorted and deduplicated, and 1 is always included.
-    #[clap(long, value_delimiter = ',', default_value = "1,5,10,20,40,80",
+    #[clap(long, value_delimiter = ',', default_value = "1,2,4,8,16,32,64,128,256",
            value_parser = clap::value_parser!(u64).range(1..))]
     depths: Vec<u64>,
 }
