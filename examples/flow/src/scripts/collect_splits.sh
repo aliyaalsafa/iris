@@ -7,14 +7,14 @@ if [[ $# -ne 3 ]]; then
 fi
 
 if [[ $EUID -ne 0 ]]; then
-    exec sudo env LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" "$0" "$@"
+    exec sudo env LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" OUT_ROOT="${OUT_ROOT:-}" "$0" "$@"
 fi
 
 cd "$(dirname "$0")/../../../.."
 
 BIN=./target/release/flow_collect
 CONFIG=configs/online.toml
-OUT_ROOT=/mnt/netdata
+OUT_ROOT=${OUT_ROOT:-/mnt/netdata}
 export RUST_LOG=info
 
 tmp_config="$(mktemp --suffix=.toml)"
