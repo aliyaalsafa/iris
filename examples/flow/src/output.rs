@@ -26,11 +26,7 @@ pub fn set_out_dir(dir: impl Into<PathBuf>) {
 
 fn out_path(name: &str) -> PathBuf {
     OUT_DIR
-        .get_or_init(|| {
-            std::env::var_os("FLOW_OUT_DIR")
-                .unwrap_or("/mnt/netdata".into())
-                .into()
-        })
+        .get_or_init(|| "/mnt/netdata".into())
         .join(name)
 }
 
