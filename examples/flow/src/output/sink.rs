@@ -1,10 +1,10 @@
 //! A single zstd-compressed Parquet file.
 //!
 //! On a network share (CIFS, NFS) `write` only fills the page cache; the data
-//! reaches the server later, and if that writeback fails (e.g. a request timing
-//! out on a `soft` mount) the bytes are silently lost and read back as zeros.
-//! The failure is reported only by `fsync`/`close`, so `close` fsyncs and every
-//! file that failed is recorded for the end-of-run report.
+//! reaches the server later. A failed writeback is reported only by
+//! `fsync`/`close`, so `close` fsyncs and every file that failed is recorded
+//! for the end-of-run report. Writes go through `AlignedWriter`, which avoids
+//! the silent loss fsync cannot see (see aligned.rs).
 
 use std::fs::File;
 use std::sync::{Arc, Mutex};
@@ -16,6 +16,7 @@ use parquet::file::properties::{WriterProperties, WriterVersion};
 use serde::Serialize;
 use serde_arrow::schema::{SchemaLike, TracingOptions};
 
+use super::aligned::AlignedWriter;
 use super::out_path;
 
 const ROW_GROUP_ROWS: usize = 1 << 17;
@@ -41,7 +42,7 @@ pub fn traced<T: Serialize>(sample: T) -> Vec<FieldRef> {
 }
 
 pub struct Sink {
-    w: ArrowWriter<File>,
+    w: ArrowWriter<AlignedWriter<File>>,
     fields: &'static [FieldRef],
     name: String,
 }
@@ -56,6 +57,7 @@ impl Sink {
             .set_writer_version(WriterVersion::PARQUET_2_0)
             .build();
         let file = File::create(&path).unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
+        let file = AlignedWriter::new(file);
         let w = ArrowWriter::try_new(file, Arc::new(Schema::new(fields.to_vec())), Some(props))
             .unwrap_or_else(|e| panic!("init writer {}: {e}", path.display()));
         Self { w, fields, name }
@@ -71,15 +73,16 @@ impl Sink {
         }
     }
 
-    /// Write the footer, then fsync: the only point at which a lost writeback
-    /// on a network share is reported. Dropping the `File` instead would
-    /// discard `close`'s error as well.
+    /// Write the footer and the aligned writer's tail, then fsync: the only
+    /// point at which a lost writeback on a network share is reported.
+    /// Dropping the `File` instead would discard `close`'s error as well.
     pub fn close(self) {
         let name = self.name;
         let res = self
             .w
             .into_inner()
             .map_err(|e| format!("finalize: {e}"))
+            .and_then(|a| a.finish().map_err(|e| format!("write tail: {e}")))
             .and_then(|f| f.sync_all().map_err(|e| format!("fsync: {e}")));
         if let Err(e) = res {
             record_failure(&name, e);

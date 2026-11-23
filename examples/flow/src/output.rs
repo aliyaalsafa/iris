@@ -4,6 +4,7 @@
 //! - `snapshot`: per-flow snapshots + final label, sharded by snapshot depth
 //! - `trace`: per-packet cumulative-bytes trace (optional)
 
+mod aligned;
 mod pool;
 mod sink;
 mod snapshot;
