@@ -1,7 +1,13 @@
 //! A single zstd-compressed Parquet file.
+//!
+//! On a network share (CIFS, NFS) `write` only fills the page cache; the data
+//! reaches the server later, and if that writeback fails (e.g. a request timing
+//! out on a `soft` mount) the bytes are silently lost and read back as zeros.
+//! The failure is reported only by `fsync`/`close`, so `close` fsyncs and every
+//! file that failed is recorded for the end-of-run report.
 
 use std::fs::File;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::{FieldRef, Schema};
 use parquet::arrow::ArrowWriter;
@@ -14,6 +20,19 @@ use super::out_path;
 
 const ROW_GROUP_ROWS: usize = 1 << 17;
 const ZSTD_LEVEL: i32 = 3;
+
+/// "<file>: <error>" for every write, finalize or fsync that failed.
+static FAILURES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn record_failure(name: &str, e: String) {
+    eprintln!("ERROR: {name}.parquet: {e}");
+    FAILURES.lock().unwrap().push(format!("{name}.parquet: {e}"));
+}
+
+/// Every failure recorded so far; empty if every file is intact on disk.
+pub fn failures() -> Vec<String> {
+    FAILURES.lock().unwrap().clone()
+}
 
 /// Derive Arrow fields from a sample value's serde shape.
 pub fn traced<T: Serialize>(sample: T) -> Vec<FieldRef> {
@@ -42,19 +61,28 @@ impl Sink {
         Self { w, fields, name }
     }
 
-    /// Append rows; errors are logged, not propagated, so one bad batch can't stop the writer.
+    /// Append rows; errors are recorded, not propagated, so one bad batch can't stop the writer.
     pub fn write<T: Serialize>(&mut self, rows: &[T]) {
         let res = serde_arrow::to_record_batch(self.fields, &rows)
             .map_err(|e| e.to_string())
             .and_then(|b| self.w.write(&b).map_err(|e| e.to_string()));
         if let Err(e) = res {
-            eprintln!("warning: writing {}: {e}", self.name);
+            record_failure(&self.name, format!("write: {e}"));
         }
     }
 
+    /// Write the footer, then fsync: the only point at which a lost writeback
+    /// on a network share is reported. Dropping the `File` instead would
+    /// discard `close`'s error as well.
     pub fn close(self) {
-        if let Err(e) = self.w.close() {
-            eprintln!("warning: closing {}: {e}", self.name);
+        let name = self.name;
+        let res = self
+            .w
+            .into_inner()
+            .map_err(|e| format!("finalize: {e}"))
+            .and_then(|f| f.sync_all().map_err(|e| format!("fsync: {e}")));
+        if let Err(e) = res {
+            record_failure(&name, e);
         }
     }
 }

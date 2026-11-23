@@ -50,6 +50,17 @@ pub fn shutdown_writer() {
 pub fn print_stats() {
     let mut report = String::from("=== Writer Dispatcher Stats ===\n");
     pools().for_each(|p| p.report(&mut report));
+    let failed = sink::failures();
+    if failed.is_empty() {
+        report.push_str("=== All parquet files written and fsynced ===\n");
+    } else {
+        report.push_str(&format!(
+            "=== {} parquet write failures: these files may hold zeroed or \
+             missing data ===\n",
+            failed.len()
+        ));
+        failed.iter().for_each(|f| report.push_str(&format!("{f}\n")));
+    }
     print!("{report}");
     let path = out_path("writer_stats.txt");
     match std::fs::write(&path, &report) {
